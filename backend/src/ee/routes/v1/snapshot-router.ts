@@ -1,13 +1,19 @@
 import { z } from "zod";
 
-import { SecretSnapshotsSchema, SecretTagsSchema, SecretVersionsSchema } from "@app/db/schemas";
+import { SecretSnapshotsSchema, SecretTagsSchema } from "@app/db/schemas";
+import { PROJECTS } from "@app/lib/api-docs";
+import { readLimit, writeLimit } from "@app/server/config/rateLimiter";
 import { verifyAuth } from "@app/server/plugins/auth/verify-auth";
+import { secretRawSchema } from "@app/server/routes/sanitizedSchemas";
 import { AuthMode } from "@app/services/auth/auth-type";
 
 export const registerSnapshotRouter = async (server: FastifyZodProvider) => {
   server.route({
     method: "GET",
     url: "/:secretSnapshotId",
+    config: {
+      rateLimit: readLimit
+    },
     schema: {
       params: z.object({
         secretSnapshotId: z.string().trim()
@@ -22,17 +28,17 @@ export const registerSnapshotRouter = async (server: FastifyZodProvider) => {
               slug: z.string(),
               name: z.string()
             }),
-            secretVersions: SecretVersionsSchema.omit({ secretBlindIndex: true })
-              .merge(
-                z.object({
-                  tags: SecretTagsSchema.pick({
-                    id: true,
-                    slug: true,
-                    name: true,
-                    color: true
-                  }).array()
-                })
-              )
+            secretVersions: secretRawSchema
+              .omit({ _id: true, environment: true, workspace: true, type: true })
+              .extend({
+                secretId: z.string(),
+                tags: SecretTagsSchema.pick({
+                  id: true,
+                  slug: true,
+                  name: true,
+                  color: true
+                }).array()
+              })
               .array(),
             folderVersion: z.object({ id: z.string(), name: z.string() }).array(),
             createdAt: z.date(),
@@ -46,6 +52,8 @@ export const registerSnapshotRouter = async (server: FastifyZodProvider) => {
       const secretSnapshot = await server.services.snapshot.getSnapshotData({
         actor: req.permission.type,
         actorId: req.permission.id,
+        actorAuthMethod: req.permission.authMethod,
+        actorOrgId: req.permission.orgId,
         id: req.params.secretSnapshotId
       });
       return { secretSnapshot };
@@ -55,9 +63,18 @@ export const registerSnapshotRouter = async (server: FastifyZodProvider) => {
   server.route({
     method: "POST",
     url: "/:secretSnapshotId/rollback",
+    config: {
+      rateLimit: writeLimit
+    },
     schema: {
+      description: "Roll back project secrets to those captured in a secret snapshot version.",
+      security: [
+        {
+          bearerAuth: []
+        }
+      ],
       params: z.object({
-        secretSnapshotId: z.string().trim()
+        secretSnapshotId: z.string().trim().describe(PROJECTS.ROLLBACK_TO_SNAPSHOT.secretSnapshotId)
       }),
       response: {
         200: z.object({
@@ -70,6 +87,8 @@ export const registerSnapshotRouter = async (server: FastifyZodProvider) => {
       const secretSnapshot = await server.services.snapshot.rollbackSnapshot({
         actor: req.permission.type,
         actorId: req.permission.id,
+        actorAuthMethod: req.permission.authMethod,
+        actorOrgId: req.permission.orgId,
         id: req.params.secretSnapshotId
       });
       return { secretSnapshot };

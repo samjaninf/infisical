@@ -16,9 +16,11 @@ export const OrgMembershipsSchema = z.object({
   updatedAt: z.date(),
   userId: z.string().uuid().nullable().optional(),
   orgId: z.string().uuid(),
-  roleId: z.string().uuid().nullable().optional()
+  roleId: z.string().uuid().nullable().optional(),
+  projectFavorites: z.string().array().nullable().optional(),
+  isActive: z.boolean().default(true)
 });
 
 export type TOrgMemberships = z.infer<typeof OrgMembershipsSchema>;
-export type TOrgMembershipsInsert = Omit<TOrgMemberships, TImmutableDBKeys>;
-export type TOrgMembershipsUpdate = Partial<Omit<TOrgMemberships, TImmutableDBKeys>>;
+export type TOrgMembershipsInsert = Omit<z.input<typeof OrgMembershipsSchema>, TImmutableDBKeys>;
+export type TOrgMembershipsUpdate = Partial<Omit<z.input<typeof OrgMembershipsSchema>, TImmutableDBKeys>>;

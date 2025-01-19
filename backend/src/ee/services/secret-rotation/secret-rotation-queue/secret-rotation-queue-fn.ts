@@ -9,6 +9,7 @@ import jmespath from "jmespath";
 import knex from "knex";
 
 import { getConfig } from "@app/lib/config/env";
+import { getDbConnectionHost } from "@app/lib/knex";
 import { alphaNumericNanoId } from "@app/lib/nanoid";
 
 import { TAssignOp, TDbProviderClients, TDirectAssignOp, THttpProviderFunction } from "../templates/types";
@@ -84,12 +85,27 @@ export const secretRotationDbFn = async ({
   password,
   username,
   client,
-  variables
+  variables,
+  options
 }: TSecretRotationDbFn) => {
   const appCfg = getConfig();
 
   const ssl = ca ? { rejectUnauthorized: false, ca } : undefined;
-  if (host === "localhost" || host === "127.0.0.1" || appCfg.DB_CONNECTION_URI.includes(host))
+  const isCloud = Boolean(appCfg.LICENSE_SERVER_KEY); // quick and dirty way to check if its cloud or not
+  const dbHost = appCfg.DB_HOST || getDbConnectionHost(appCfg.DB_CONNECTION_URI);
+
+  if (
+    isCloud &&
+    // internal ips
+    (host === "host.docker.internal" || host.match(/^10\.\d+\.\d+\.\d+/) || host.match(/^192\.168\.\d+\.\d+/))
+  )
+    throw new Error("Invalid db host");
+  if (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    // database infisical uses
+    dbHost === host
+  )
     throw new Error("Invalid db host");
 
   const db = knex({
@@ -102,7 +118,8 @@ export const secretRotationDbFn = async ({
       password,
       connectionTimeoutMillis: EXTERNAL_REQUEST_TIMEOUT,
       ssl,
-      pool: { min: 0, max: 1 }
+      pool: { min: 0, max: 1 },
+      options
     }
   });
   const data = await db.raw(query, variables);
@@ -138,6 +155,14 @@ export const getDbSetQuery = (db: TDbProviderClients, variables: { username: str
       variables: [variables.username]
     };
   }
+
+  if (db === TDbProviderClients.MsSqlServer) {
+    return {
+      query: `ALTER LOGIN ?? WITH PASSWORD = '${variables.password}'`,
+      variables: [variables.username]
+    };
+  }
+
   // add more based on client
   return {
     query: `ALTER USER ?? IDENTIFIED BY '${variables.password}'`,

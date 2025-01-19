@@ -1,5 +1,6 @@
-import { seedData1 } from "@app/db/seed-data";
 import jsrp from "jsrp";
+
+import { seedData1 } from "@app/db/seed-data";
 
 describe("Login V1 Router", async () => {
   // eslint-disable-next-line
@@ -38,8 +39,6 @@ describe("Login V1 Router", async () => {
     });
     expect(res.statusCode).toBe(200);
     const payload = JSON.parse(res.payload);
-    expect(payload).toHaveProperty("mfaEnabled");
     expect(payload).toHaveProperty("token");
-    expect(payload.mfaEnabled).toBeFalsy();
   });
 });

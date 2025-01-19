@@ -19,9 +19,11 @@ export const IdentityAccessTokensSchema = z.object({
   identityUAClientSecretId: z.string().nullable().optional(),
   identityId: z.string().uuid(),
   createdAt: z.date(),
-  updatedAt: z.date()
+  updatedAt: z.date(),
+  name: z.string().nullable().optional(),
+  authMethod: z.string()
 });
 
 export type TIdentityAccessTokens = z.infer<typeof IdentityAccessTokensSchema>;
-export type TIdentityAccessTokensInsert = Omit<TIdentityAccessTokens, TImmutableDBKeys>;
-export type TIdentityAccessTokensUpdate = Partial<Omit<TIdentityAccessTokens, TImmutableDBKeys>>;
+export type TIdentityAccessTokensInsert = Omit<z.input<typeof IdentityAccessTokensSchema>, TImmutableDBKeys>;
+export type TIdentityAccessTokensUpdate = Partial<Omit<z.input<typeof IdentityAccessTokensSchema>, TImmutableDBKeys>>;

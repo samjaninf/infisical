@@ -5,6 +5,8 @@
 
 import { z } from "zod";
 
+import { zodBuffer } from "@app/lib/zod";
+
 import { TImmutableDBKeys } from "./models";
 
 export const IntegrationAuthsSchema = z.object({
@@ -29,9 +31,16 @@ export const IntegrationAuthsSchema = z.object({
   keyEncoding: z.string(),
   projectId: z.string(),
   createdAt: z.date(),
-  updatedAt: z.date()
+  updatedAt: z.date(),
+  awsAssumeIamRoleArnCipherText: z.string().nullable().optional(),
+  awsAssumeIamRoleArnIV: z.string().nullable().optional(),
+  awsAssumeIamRoleArnTag: z.string().nullable().optional(),
+  encryptedAccess: zodBuffer.nullable().optional(),
+  encryptedAccessId: zodBuffer.nullable().optional(),
+  encryptedRefresh: zodBuffer.nullable().optional(),
+  encryptedAwsAssumeIamRoleArn: zodBuffer.nullable().optional()
 });
 
 export type TIntegrationAuths = z.infer<typeof IntegrationAuthsSchema>;
-export type TIntegrationAuthsInsert = Omit<TIntegrationAuths, TImmutableDBKeys>;
-export type TIntegrationAuthsUpdate = Partial<Omit<TIntegrationAuths, TImmutableDBKeys>>;
+export type TIntegrationAuthsInsert = Omit<z.input<typeof IntegrationAuthsSchema>, TImmutableDBKeys>;
+export type TIntegrationAuthsUpdate = Partial<Omit<z.input<typeof IntegrationAuthsSchema>, TImmutableDBKeys>>;

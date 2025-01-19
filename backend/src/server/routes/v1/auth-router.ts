@@ -2,8 +2,8 @@ import jwt from "jsonwebtoken";
 import { z } from "zod";
 
 import { getConfig } from "@app/lib/config/env";
-import { BadRequestError, UnauthorizedError } from "@app/lib/errors";
-import { authRateLimit } from "@app/server/config/rateLimiter";
+import { NotFoundError, UnauthorizedError } from "@app/lib/errors";
+import { authRateLimit, writeLimit } from "@app/server/config/rateLimiter";
 import { verifyAuth } from "@app/server/plugins/auth/verify-auth";
 import { AuthMode, AuthModeRefreshJwtTokenPayload, AuthTokenType } from "@app/services/auth/auth-type";
 
@@ -21,7 +21,7 @@ export const registerAuthRoutes = async (server: FastifyZodProvider) => {
         })
       }
     },
-    onRequest: verifyAuth([AuthMode.JWT]),
+    onRequest: verifyAuth([AuthMode.JWT], { requireOrg: false }),
     handler: async (req, res) => {
       const appCfg = getConfig();
       if (req.auth.authMode === AuthMode.JWT) {
@@ -38,8 +38,11 @@ export const registerAuthRoutes = async (server: FastifyZodProvider) => {
   });
 
   server.route({
-    url: "/checkAuth",
     method: "POST",
+    url: "/checkAuth",
+    config: {
+      rateLimit: writeLimit
+    },
     schema: {
       response: {
         200: z.object({
@@ -52,12 +55,16 @@ export const registerAuthRoutes = async (server: FastifyZodProvider) => {
   });
 
   server.route({
-    url: "/token",
     method: "POST",
+    url: "/token",
+    config: {
+      rateLimit: writeLimit
+    },
     schema: {
       response: {
         200: z.object({
-          token: z.string()
+          token: z.string(),
+          organizationId: z.string().optional()
         })
       }
     },
@@ -65,36 +72,51 @@ export const registerAuthRoutes = async (server: FastifyZodProvider) => {
       const refreshToken = req.cookies.jid;
       const appCfg = getConfig();
       if (!refreshToken)
-        throw new BadRequestError({
-          name: "Auth token route",
-          message: "Failed  to find refresh token"
+        throw new NotFoundError({
+          name: "AuthTokenNotFound",
+          message: "Failed to find refresh token"
         });
 
       const decodedToken = jwt.verify(refreshToken, appCfg.AUTH_SECRET) as AuthModeRefreshJwtTokenPayload;
       if (decodedToken.authTokenType !== AuthTokenType.REFRESH_TOKEN)
-        throw new UnauthorizedError({ message: "Invalid token", name: "Auth token route" });
+        throw new UnauthorizedError({
+          message: "The token provided is not a refresh token",
+          name: "InvalidToken"
+        });
 
       const tokenVersion = await server.services.authToken.getUserTokenSessionById(
         decodedToken.tokenVersionId,
         decodedToken.userId
       );
-      if (!tokenVersion) throw new UnauthorizedError({ message: "Invalid token", name: "Auth token route" });
+      if (!tokenVersion)
+        throw new UnauthorizedError({
+          message: "Valid token version not found",
+          name: "InvalidToken"
+        });
 
-      if (decodedToken.refreshVersion !== tokenVersion.refreshVersion)
-        throw new UnauthorizedError({ message: "Invalid token", name: "Auth token route" });
+      if (decodedToken.refreshVersion !== tokenVersion.refreshVersion) {
+        throw new UnauthorizedError({
+          message: "Token version mismatch",
+          name: "InvalidToken"
+        });
+      }
 
       const token = jwt.sign(
         {
+          authMethod: decodedToken.authMethod,
           authTokenType: AuthTokenType.ACCESS_TOKEN,
           userId: decodedToken.userId,
           tokenVersionId: tokenVersion.id,
-          accessVersion: tokenVersion.accessVersion
+          accessVersion: tokenVersion.accessVersion,
+          organizationId: decodedToken.organizationId,
+          isMfaVerified: decodedToken.isMfaVerified,
+          mfaMethod: decodedToken.mfaMethod
         },
         appCfg.AUTH_SECRET,
         { expiresIn: appCfg.JWT_AUTH_LIFETIME }
       );
 
-      return { token };
+      return { token, organizationId: decodedToken.organizationId };
     }
   });
 };

@@ -15,9 +15,10 @@ export const ProjectRolesSchema = z.object({
   permissions: z.unknown(),
   createdAt: z.date(),
   updatedAt: z.date(),
-  projectId: z.string()
+  projectId: z.string(),
+  version: z.number().default(1)
 });
 
 export type TProjectRoles = z.infer<typeof ProjectRolesSchema>;
-export type TProjectRolesInsert = Omit<TProjectRoles, TImmutableDBKeys>;
-export type TProjectRolesUpdate = Partial<Omit<TProjectRoles, TImmutableDBKeys>>;
+export type TProjectRolesInsert = Omit<z.input<typeof ProjectRolesSchema>, TImmutableDBKeys>;
+export type TProjectRolesUpdate = Partial<Omit<z.input<typeof ProjectRolesSchema>, TImmutableDBKeys>>;

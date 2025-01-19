@@ -2,7 +2,9 @@ import jwt from "jsonwebtoken";
 import { z } from "zod";
 
 import { getConfig } from "@app/lib/config/env";
-import { AuthModeMfaJwtTokenPayload, AuthTokenType } from "@app/services/auth/auth-type";
+import { BadRequestError, NotFoundError } from "@app/lib/errors";
+import { mfaRateLimit } from "@app/server/config/rateLimiter";
+import { AuthModeMfaJwtTokenPayload, AuthTokenType, MfaMethod } from "@app/services/auth/auth-type";
 
 export const registerMfaRouter = async (server: FastifyZodProvider) => {
   const cfg = getConfig();
@@ -26,12 +28,15 @@ export const registerMfaRouter = async (server: FastifyZodProvider) => {
 
     const user = await server.store.user.findById(decodedToken.userId);
     if (!user) throw new Error("User not found");
-    req.mfa = { userId: user.id, user };
+    req.mfa = { userId: user.id, user, orgId: decodedToken.organizationId };
   });
 
   server.route({
-    url: "/mfa/send",
     method: "POST",
+    url: "/mfa/send",
+    config: {
+      rateLimit: mfaRateLimit
+    },
     schema: {
       response: {
         200: z.object({
@@ -46,11 +51,47 @@ export const registerMfaRouter = async (server: FastifyZodProvider) => {
   });
 
   server.route({
+    method: "GET",
+    url: "/mfa/check/totp",
+    config: {
+      rateLimit: mfaRateLimit
+    },
+    schema: {
+      response: {
+        200: z.object({
+          isVerified: z.boolean()
+        })
+      }
+    },
+    handler: async (req) => {
+      try {
+        const totpConfig = await server.services.totp.getUserTotpConfig({
+          userId: req.mfa.userId
+        });
+
+        return {
+          isVerified: Boolean(totpConfig)
+        };
+      } catch (error) {
+        if (error instanceof NotFoundError || error instanceof BadRequestError) {
+          return { isVerified: false };
+        }
+
+        throw error;
+      }
+    }
+  });
+
+  server.route({
     url: "/mfa/verify",
     method: "POST",
+    config: {
+      rateLimit: mfaRateLimit
+    },
     schema: {
       body: z.object({
-        mfaToken: z.string().trim()
+        mfaToken: z.string().trim(),
+        mfaMethod: z.nativeEnum(MfaMethod).optional().default(MfaMethod.EMAIL)
       }),
       response: {
         200: z.object({
@@ -68,14 +109,19 @@ export const registerMfaRouter = async (server: FastifyZodProvider) => {
     },
     handler: async (req, res) => {
       const userAgent = req.headers["user-agent"];
+      const mfaJwtToken = req.headers.authorization?.replace("Bearer ", "");
       if (!userAgent) throw new Error("user agent header is required");
+      if (!mfaJwtToken) throw new Error("authorization header is required");
       const appCfg = getConfig();
 
       const { user, token } = await server.services.login.verifyMfaToken({
         userAgent,
+        mfaJwtToken,
         ip: req.realIp,
         userId: req.mfa.userId,
-        mfaToken: req.body.mfaToken
+        orgId: req.mfa.orgId,
+        mfaToken: req.body.mfaToken,
+        mfaMethod: req.body.mfaMethod
       });
 
       void res.setCookie("jid", token.refresh, {

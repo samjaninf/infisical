@@ -7,6 +7,7 @@ export type TCreateSecretImportDTO = {
     environment: string;
     path: string;
   };
+  isReplication?: boolean;
 } & TProjectPermission;
 
 export type TUpdateSecretImportDTO = {
@@ -14,6 +15,12 @@ export type TUpdateSecretImportDTO = {
   path: string;
   id: string;
   data: Partial<{ environment: string; path: string; position: number }>;
+} & TProjectPermission;
+
+export type TResyncSecretImportReplicationDTO = {
+  environment: string;
+  path: string;
+  id: string;
 } & TProjectPermission;
 
 export type TDeleteSecretImportDTO = {
@@ -25,7 +32,14 @@ export type TDeleteSecretImportDTO = {
 export type TGetSecretImportsDTO = {
   environment: string;
   path: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
 } & TProjectPermission;
+
+export type TGetSecretImportByIdDTO = {
+  id: string;
+} & Omit<TProjectPermission, "projectId">;
 
 export type TGetSecretsFromImportDTO = {
   environment: string;

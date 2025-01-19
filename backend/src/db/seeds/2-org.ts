@@ -14,7 +14,8 @@ export async function seed(knex: Knex): Promise<void> {
   const [org] = await knex(TableName.Organization)
     .insert([
       {
-        // @ts-expect-error exluded type id needs to be inserted here to keep it testable
+        // eslint-disable-next-line
+        // @ts-ignore
         id: seedData1.organization.id,
         name: "infisical",
         slug: "infisical",
@@ -28,7 +29,8 @@ export async function seed(knex: Knex): Promise<void> {
       role: OrgMembershipRole.Admin,
       orgId: org.id,
       status: OrgMembershipStatus.Accepted,
-      userId: user.id
+      userId: user.id,
+      isActive: true
     }
   ]);
 }

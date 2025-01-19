@@ -23,8 +23,19 @@ export const conditionsMatcher = buildMongoQueryMatcher({ $glob }, { glob });
 /**
  * Extracts and formats permissions from a CASL Ability object or a raw permission set.
  */
-const extractPermissions = (ability: MongoAbility) =>
-  ability.rules.map((permission) => `${permission.action as string}_${permission.subject as string}`);
+const extractPermissions = (ability: MongoAbility) => {
+  const permissions: string[] = [];
+  ability.rules.forEach((permission) => {
+    if (typeof permission.action === "string") {
+      permissions.push(`${permission.action}_${permission.subject as string}`);
+    } else {
+      permission.action.forEach((permissionAction) => {
+        permissions.push(`${permissionAction}_${permission.subject as string}`);
+      });
+    }
+  });
+  return permissions;
+};
 
 /**
  * Compares two sets of permissions to determine if the first set is at least as privileged as the second set.
@@ -43,3 +54,12 @@ export const isAtLeastAsPrivileged = (permissions1: MongoAbility, permissions2: 
 
   return set1.size >= set2.size;
 };
+
+export enum PermissionConditionOperators {
+  $IN = "$in",
+  $ALL = "$all",
+  $REGEX = "$regex",
+  $EQ = "$eq",
+  $NEQ = "$ne",
+  $GLOB = "$glob"
+}

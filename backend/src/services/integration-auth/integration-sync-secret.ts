@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-call */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-unsafe-argument */
@@ -8,23 +9,51 @@
 
 import {
   CreateSecretCommand,
+  DeleteSecretCommand,
+  DescribeSecretCommand,
   GetSecretValueCommand,
   ResourceNotFoundException,
   SecretsManagerClient,
+  TagResourceCommand,
+  UntagResourceCommand,
   UpdateSecretCommand
 } from "@aws-sdk/client-secrets-manager";
+import { AssumeRoleCommand, STSClient } from "@aws-sdk/client-sts";
+import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/rest";
-import AWS from "aws-sdk";
+import AWS, { AWSError } from "aws-sdk";
 import { AxiosError } from "axios";
+import { randomUUID } from "crypto";
+import https from "https";
 import sodium from "libsodium-wrappers";
 import isEqual from "lodash.isequal";
 import { z } from "zod";
 
-import { TIntegrationAuths, TIntegrations } from "@app/db/schemas";
+import { SecretType, TIntegrationAuths, TIntegrations } from "@app/db/schemas";
+import { getConfig } from "@app/lib/config/env";
 import { request } from "@app/lib/config/request";
-import { BadRequestError } from "@app/lib/errors";
+import { BadRequestError, InternalServerError } from "@app/lib/errors";
+import { logger } from "@app/lib/logger";
+import { TCreateManySecretsRawFn, TUpdateManySecretsRawFn } from "@app/services/secret/secret-types";
 
-import { Integrations, IntegrationUrls } from "./integration-list";
+import { TIntegrationDALFactory } from "../integration/integration-dal";
+import { IntegrationMetadataSchema } from "../integration/integration-schema";
+import { ResourceMetadataDTO } from "../resource-metadata/resource-metadata-schema";
+import { IntegrationAuthMetadataSchema } from "./integration-auth-schema";
+import {
+  CircleCiScope,
+  OctopusDeployScope,
+  TIntegrationsWithEnvironment,
+  TOctopusDeployVariableSet
+} from "./integration-auth-types";
+import {
+  IntegrationInitialSyncBehavior,
+  IntegrationMappingBehavior,
+  IntegrationMetadataSyncMode,
+  Integrations,
+  IntegrationUrls
+} from "./integration-list";
+import { isAzureKeyVaultReference } from "./integration-sync-secret-fns";
 
 const getSecretKeyValuePair = (secrets: Record<string, { value: string | null; comment?: string } | null>) =>
   Object.keys(secrets).reduce<Record<string, string | null | undefined>>((prev, key) => {
@@ -190,6 +219,12 @@ const syncSecretsGCPSecretManager = async ({
         }
       );
 
+      if (!secrets[key].value) {
+        logger.warn(
+          `syncSecretsGcpsecretManager: create secret value in gcp where [key=${key}] and integration appId [appId=${integration.appId}]`
+        );
+      }
+
       await request.post(
         `${IntegrationUrls.GCP_SECRET_MANAGER_URL}/v1/projects/${integration.appId}/secrets/${key}:addVersion`,
         {
@@ -220,6 +255,12 @@ const syncSecretsGCPSecretManager = async ({
         }
       );
     } else if (secrets[key].value !== res[key]) {
+      if (!secrets[key].value) {
+        logger.warn(
+          `syncSecretsGcpsecretManager: update secret value in gcp where [key=${key}] and integration appId [appId=${integration.appId}]`
+        );
+      }
+
       await request.post(
         `${IntegrationUrls.GCP_SECRET_MANAGER_URL}/v1/projects/${integration.appId}/secrets/${key}:addVersion`,
         {
@@ -238,22 +279,233 @@ const syncSecretsGCPSecretManager = async ({
   }
 };
 
+const syncSecretsAzureAppConfig = async ({
+  integration,
+  secrets,
+  accessToken,
+  createManySecretsRawFn,
+  updateManySecretsRawFn,
+  integrationDAL
+}: {
+  integration: TIntegrations & {
+    projectId: string;
+    environment: {
+      id: string;
+      name: string;
+      slug: string;
+    };
+    secretPath: string;
+  };
+  secrets: Record<string, { value: string; comment?: string } | null>;
+  accessToken: string;
+  createManySecretsRawFn: (params: TCreateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  updateManySecretsRawFn: (params: TUpdateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  integrationDAL: Pick<TIntegrationDALFactory, "updateById">;
+}) => {
+  interface AzureAppConfigKeyValue {
+    key: string;
+    value: string;
+  }
+
+  if (!integration.app || !integration.app.endsWith(".azconfig.io"))
+    throw new BadRequestError({
+      message: "Invalid Azure App Configuration URL provided."
+    });
+
+  const getCompleteAzureAppConfigValues = async (baseURL: string, url: string) => {
+    let result: AzureAppConfigKeyValue[] = [];
+    while (url) {
+      const res = await request.get(url, {
+        baseURL,
+        headers: {
+          Authorization: `Bearer ${accessToken}`
+        },
+        // we force IPV4 because docker setup fails with ipv6
+        httpsAgent: new https.Agent({
+          family: 4
+        })
+      });
+
+      result = result.concat(res.data.items);
+      url = res.data?.["@nextLink"];
+    }
+
+    return result;
+  };
+
+  const metadata = IntegrationMetadataSchema.parse(integration.metadata);
+
+  const azureAppConfigValuesUrl = `/kv?api-version=2023-11-01&key=${metadata.secretPrefix}*${
+    metadata.azureLabel ? `&label=${metadata.azureLabel}` : "&label=%00"
+  }`;
+
+  const azureAppConfigSecrets = (
+    await getCompleteAzureAppConfigValues(integration.app, azureAppConfigValuesUrl)
+  ).reduce(
+    (accum, entry) => {
+      accum[entry.key] = entry.value;
+
+      return accum;
+    },
+    {} as Record<string, string>
+  );
+
+  const secretsToAdd: { [key: string]: string } = {};
+  const secretsToUpdate: { [key: string]: string } = {};
+
+  Object.keys(azureAppConfigSecrets).forEach((key) => {
+    if (!integration.lastUsed) {
+      // first time using integration
+      // -> apply initial sync behavior
+      switch (metadata.initialSyncBehavior) {
+        case IntegrationInitialSyncBehavior.OVERWRITE_TARGET: {
+          if (!(key in secrets)) {
+            secrets[key] = null;
+          }
+          break;
+        }
+        case IntegrationInitialSyncBehavior.PREFER_TARGET: {
+          if (!(key in secrets)) {
+            secretsToAdd[key] = azureAppConfigSecrets[key];
+          } else if (secrets[key]?.value !== azureAppConfigSecrets[key]) {
+            secretsToUpdate[key] = azureAppConfigSecrets[key];
+          }
+          secrets[key] = {
+            value: azureAppConfigSecrets[key]
+          };
+          break;
+        }
+        case IntegrationInitialSyncBehavior.PREFER_SOURCE: {
+          if (!(key in secrets)) {
+            secrets[key] = {
+              value: azureAppConfigSecrets[key]
+            };
+            secretsToAdd[key] = azureAppConfigSecrets[key];
+          }
+          break;
+        }
+        default: {
+          break;
+        }
+      }
+    } else if (!(key in secrets)) {
+      secrets[key] = null;
+    }
+  });
+
+  if (Object.keys(secretsToAdd).length) {
+    await createManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToAdd).map((key) => ({
+        secretName: key,
+        secretValue: secretsToAdd[key],
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
+    });
+  }
+
+  if (Object.keys(secretsToUpdate).length) {
+    await updateManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToUpdate).map((key) => ({
+        secretName: key,
+        secretValue: secretsToUpdate[key],
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
+    });
+  }
+
+  // create or update secrets on Azure App Config
+
+  for await (const key of Object.keys(secrets)) {
+    if (!(key in azureAppConfigSecrets) || secrets[key]?.value !== azureAppConfigSecrets[key]) {
+      await request.put(
+        `${integration.app}/kv/${key}?api-version=2023-11-01`,
+        {
+          value: secrets[key]?.value,
+          ...(isAzureKeyVaultReference(secrets[key]?.value || "") && {
+            content_type: "application/vnd.microsoft.appconfig.keyvaultref+json;charset=utf-8"
+          })
+        },
+        {
+          ...(metadata.azureLabel && {
+            params: {
+              label: metadata.azureLabel
+            }
+          }),
+
+          headers: {
+            Authorization: `Bearer ${accessToken}`
+          },
+          // we force IPV4 because docker setup fails with ipv6
+          httpsAgent: new https.Agent({
+            family: 4
+          })
+        }
+      );
+    }
+  }
+
+  for await (const key of Object.keys(azureAppConfigSecrets)) {
+    if (!(key in secrets) || secrets[key] === null) {
+      // case: delete secret
+      await request.delete(`${integration.app}/kv/${key}?api-version=2023-11-01`, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`
+        },
+        ...(metadata.azureLabel && {
+          params: {
+            label: metadata.azureLabel
+          }
+        }),
+        // we force IPV4 because docker setup fails with ipv6
+        httpsAgent: new https.Agent({
+          family: 4
+        })
+      });
+    }
+  }
+
+  await integrationDAL.updateById(integration.id, {
+    lastUsed: new Date()
+  });
+};
+
 /**
  * Sync/push [secrets] to Azure Key Vault with vault URI [integration.app]
  */
 const syncSecretsAzureKeyVault = async ({
   integration,
   secrets,
-  accessToken
+  accessToken,
+  createManySecretsRawFn,
+  updateManySecretsRawFn
 }: {
-  integration: TIntegrations;
+  integration: TIntegrations & {
+    projectId: string;
+    environment: {
+      id: string;
+      name: string;
+      slug: string;
+    };
+    secretPath: string;
+  };
   secrets: Record<string, { value: string; comment?: string }>;
   accessToken: string;
+  createManySecretsRawFn: (params: TCreateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  updateManySecretsRawFn: (params: TUpdateManySecretsRawFn) => Promise<Array<{ id: string }>>;
 }) => {
   interface GetAzureKeyVaultSecret {
     id: string; // secret URI
+    value: string;
     attributes: {
-      enabled: true;
+      enabled: boolean;
       created: number;
       updated: number;
       recoveryLevel: string;
@@ -289,10 +541,19 @@ const syncSecretsAzureKeyVault = async ({
 
   const getAzureKeyVaultSecrets = await paginateAzureKeyVaultSecrets(`${integration.app}/secrets?api-version=7.3`);
 
+  const enabledAzureKeyVaultSecrets = getAzureKeyVaultSecrets.filter((secret) => secret.attributes.enabled);
+
+  // disabled keys to skip sending updates to
+  const disabledAzureKeyVaultSecretKeys = getAzureKeyVaultSecrets
+    .filter(({ attributes }) => !attributes.enabled)
+    .map((getAzureKeyVaultSecret) => {
+      return getAzureKeyVaultSecret.id.substring(getAzureKeyVaultSecret.id.lastIndexOf("/") + 1);
+    });
+
   let lastSlashIndex: number;
   const res = (
     await Promise.all(
-      getAzureKeyVaultSecrets.map(async (getAzureKeyVaultSecret) => {
+      enabledAzureKeyVaultSecrets.map(async (getAzureKeyVaultSecret) => {
         if (!lastSlashIndex) {
           lastSlashIndex = getAzureKeyVaultSecret.id.lastIndexOf("/");
         }
@@ -348,6 +609,83 @@ const syncSecretsAzureKeyVault = async ({
     }
   });
 
+  const secretsToAdd: { [key: string]: string } = {};
+  const secretsToUpdate: { [key: string]: string } = {};
+  const secretKeysToRemoveFromDelete = new Set<string>();
+
+  const metadata = IntegrationMetadataSchema.parse(integration.metadata);
+  if (!integration.lastUsed) {
+    Object.keys(res).forEach((key) => {
+      // first time using integration
+      const underscoredKey = key.replace(/-/g, "_");
+
+      // -> apply initial sync behavior
+      switch (metadata.initialSyncBehavior) {
+        case IntegrationInitialSyncBehavior.PREFER_TARGET: {
+          if (!(underscoredKey in secrets)) {
+            secretsToAdd[underscoredKey] = res[key].value;
+            setSecrets.push({
+              key,
+              value: res[key].value
+            });
+          } else if (secrets[underscoredKey]?.value !== res[key].value) {
+            secretsToUpdate[underscoredKey] = res[key].value;
+            const toEditSecretIndex = setSecrets.findIndex((secret) => secret.key === key);
+            if (toEditSecretIndex >= 0) {
+              setSecrets[toEditSecretIndex].value = res[key].value;
+            }
+          }
+
+          secretKeysToRemoveFromDelete.add(key);
+
+          break;
+        }
+        case IntegrationInitialSyncBehavior.PREFER_SOURCE: {
+          if (!(underscoredKey in secrets)) {
+            secretsToAdd[underscoredKey] = res[key].value;
+            setSecrets.push({
+              key,
+              value: res[key].value
+            });
+          }
+
+          secretKeysToRemoveFromDelete.add(key);
+          break;
+        }
+        default:
+          break;
+      }
+    });
+  }
+
+  if (Object.keys(secretsToUpdate).length) {
+    await updateManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToUpdate).map((key) => ({
+        secretName: key,
+        secretValue: secretsToUpdate[key],
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
+    });
+  }
+
+  if (Object.keys(secretsToAdd).length) {
+    await createManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToAdd).map((key) => ({
+        secretName: key,
+        secretValue: secretsToAdd[key],
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
+    });
+  }
+
   const setSecretAzureKeyVault = async ({
     key,
     value,
@@ -361,6 +699,7 @@ const syncSecretsAzureKeyVault = async ({
   }) => {
     let isSecretSet = false;
     let maxTries = 6;
+    if (disabledAzureKeyVaultSecretKeys.includes(key)) return;
 
     while (!isSecretSet && maxTries > 0) {
       // try to set secret
@@ -415,7 +754,7 @@ const syncSecretsAzureKeyVault = async ({
     });
   }
 
-  for await (const deleteSecret of deleteSecrets) {
+  for await (const deleteSecret of deleteSecrets.filter((secret) => !secretKeysToRemoveFromDelete.has(secret.key))) {
     const { key } = deleteSecret;
     await request.delete(`${integration.app}/secrets/${key}?api-version=7.3`, {
       headers: {
@@ -432,94 +771,317 @@ const syncSecretsAWSParameterStore = async ({
   integration,
   secrets,
   accessId,
-  accessToken
+  accessToken,
+  projectId,
+  awsAssumeRoleArn
 }: {
-  integration: TIntegrations;
+  integration: TIntegrations & { secretPath: string; environment: { slug: string } };
   secrets: Record<string, { value: string; comment?: string }>;
   accessId: string | null;
   accessToken: string;
+  awsAssumeRoleArn: string | null;
+  projectId?: string;
 }) => {
-  if (!accessId) return;
+  const appCfg = getConfig();
+  let response: { isSynced: boolean; syncMessage: string } | null = null;
 
-  AWS.config.update({
+  if (!accessId && !awsAssumeRoleArn) {
+    throw new Error("AWS access ID/AWS Assume Role is required");
+  }
+
+  let accessKeyId = "";
+  let secretAccessKey = "";
+  let sessionToken;
+  if (awsAssumeRoleArn) {
+    const client = new STSClient({
+      region: integration.region as string,
+      credentials:
+        appCfg.CLIENT_ID_AWS_INTEGRATION && appCfg.CLIENT_SECRET_AWS_INTEGRATION
+          ? {
+              accessKeyId: appCfg.CLIENT_ID_AWS_INTEGRATION,
+              secretAccessKey: appCfg.CLIENT_SECRET_AWS_INTEGRATION
+            }
+          : undefined
+    });
+    const command = new AssumeRoleCommand({
+      RoleArn: awsAssumeRoleArn,
+      RoleSessionName: `infisical-parameter-store-${randomUUID()}`,
+      DurationSeconds: 900, // 15mins
+      ExternalId: projectId
+    });
+    const assumeRes = await client.send(command);
+
+    if (!assumeRes.Credentials?.AccessKeyId || !assumeRes.Credentials?.SecretAccessKey) {
+      throw new Error("Failed to assume role");
+    }
+
+    accessKeyId = assumeRes.Credentials?.AccessKeyId;
+    secretAccessKey = assumeRes.Credentials?.SecretAccessKey;
+    sessionToken = assumeRes.Credentials?.SessionToken;
+  } else {
+    accessKeyId = accessId as string;
+    secretAccessKey = accessToken;
+  }
+
+  const config = new AWS.Config({
     region: integration.region as string,
-    accessKeyId: accessId,
-    secretAccessKey: accessToken
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+      sessionToken
+    }
   });
 
   const ssm = new AWS.SSM({
     apiVersion: "2014-11-06",
     region: integration.region as string
   });
+  ssm.config.update(config);
 
-  const params = {
-    Path: integration.path as string,
-    Recursive: true,
-    WithDecryption: true
-  };
+  const metadata = IntegrationMetadataSchema.parse(integration.metadata);
+  const awsParameterStoreSecretsObj: Record<string, AWS.SSM.Parameter & { KeyId?: string }> = {};
+  logger.info(
+    `getIntegrationSecrets: integration sync triggered for ssm with [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}] [shouldDisableDelete=${metadata.shouldDisableDelete}]`
+  );
+  // now fetch all aws parameter store secrets
+  let hasNext = true;
+  let nextToken: string | undefined;
+  while (hasNext) {
+    const parameters = await ssm
+      .getParametersByPath({
+        Path: integration.path as string,
+        Recursive: false,
+        WithDecryption: true,
+        MaxResults: 10,
+        NextToken: nextToken
+      })
+      .promise();
 
-  const parameterList = (await ssm.getParametersByPath(params).promise()).Parameters;
+    if (parameters.Parameters) {
+      parameters.Parameters.forEach((parameter) => {
+        if (parameter.Name) {
+          const secKey = parameter.Name.substring((integration.path as string).length);
+          awsParameterStoreSecretsObj[secKey] = parameter;
+        }
+      });
+    }
+    hasNext = Boolean(parameters.NextToken);
+    nextToken = parameters.NextToken;
+  }
 
-  const awsParameterStoreSecretsObj = (parameterList || [])
-    .filter(({ Name }) => Boolean(Name))
-    .reduce(
-      (obj, secret) => ({
-        ...obj,
-        [(secret.Name as string).substring((integration.path as string).length)]: secret
-      }),
-      {} as Record<string, AWS.SSM.Parameter>
-    );
+  let areParametersKmsKeysFetched = false;
+
+  if (metadata.kmsKeyId) {
+    // we put this inside a try catch so that existing integrations without the ssm:DescribeParameters
+    // AWS permission will not break
+    try {
+      let hasNextDescribePage = true;
+      let describeNextToken: string | undefined;
+
+      while (hasNextDescribePage) {
+        const parameters = await ssm
+          .describeParameters({
+            MaxResults: 10,
+            NextToken: describeNextToken,
+            ParameterFilters: [
+              {
+                Key: "Path",
+                Option: "OneLevel",
+                Values: [integration.path as string]
+              }
+            ]
+          })
+          .promise();
+
+        if (parameters.Parameters) {
+          parameters.Parameters.forEach((parameter) => {
+            if (parameter.Name) {
+              const secKey = parameter.Name.substring((integration.path as string).length);
+              awsParameterStoreSecretsObj[secKey].KeyId = parameter.KeyId;
+            }
+          });
+        }
+        areParametersKmsKeysFetched = true;
+        hasNextDescribePage = Boolean(parameters.NextToken);
+        describeNextToken = parameters.NextToken;
+      }
+    } catch (error) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if ((error as any).code === "AccessDeniedException") {
+        logger.error(
+          `AWS Parameter Store Error [integration=${integration.id}]: double check AWS account permissions (refer to the Infisical docs)`
+        );
+      }
+
+      response = {
+        isSynced: false,
+        syncMessage: (error as AWSError)?.message || "Error syncing with AWS Parameter Store"
+      };
+    }
+  }
 
   // Identify secrets to create
-  await Promise.all(
-    Object.keys(secrets).map(async (key) => {
+  // don't use Promise.all() and promise map here
+  // it will cause rate limit
+  for (const key in secrets) {
+    if (Object.hasOwn(secrets, key)) {
       if (!(key in awsParameterStoreSecretsObj)) {
         // case: secret does not exist in AWS parameter store
         // -> create secret
-        await ssm
-          .putParameter({
-            Name: `${integration.path}${key}`,
-            Type: "SecureString",
-            Value: secrets[key].value,
-            Overwrite: true
-          })
-          .promise();
+        if (secrets[key].value) {
+          logger.info(
+            `getIntegrationSecrets: create secret in AWS SSM for [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}]`
+          );
+
+          try {
+            await ssm
+              .putParameter({
+                Name: `${integration.path}${key}`,
+                Type: "SecureString",
+                Value: secrets[key].value,
+                ...(metadata.kmsKeyId && { KeyId: metadata.kmsKeyId }),
+                Overwrite: true
+              })
+              .promise();
+          } catch (error) {
+            (error as { secretKey: string }).secretKey = key;
+            throw error;
+          }
+
+          if (metadata.secretAWSTag?.length) {
+            try {
+              await ssm
+                .addTagsToResource({
+                  ResourceType: "Parameter",
+                  ResourceId: `${integration.path}${key}`,
+                  Tags: metadata.secretAWSTag
+                    ? metadata.secretAWSTag.map((tag: { key: string; value: string }) => ({
+                        Key: tag.key,
+                        Value: tag.value
+                      }))
+                    : []
+                })
+                .promise();
+            } catch (err) {
+              logger.error(
+                err,
+                `getIntegrationSecrets: create secret in AWS SSM for failed  [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}]`
+              );
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              if ((err as any).code === "AccessDeniedException") {
+                logger.error(
+                  `AWS Parameter Store Error [integration=${integration.id}]: double check AWS account permissions (refer to the Infisical docs)`
+                );
+              }
+
+              response = {
+                isSynced: false,
+                syncMessage: (err as AWSError)?.message || "Error syncing with AWS Parameter Store"
+              };
+            }
+          }
+        }
         // case: secret exists in AWS parameter store
-      } else if (awsParameterStoreSecretsObj[key].Value !== secrets[key].value) {
-        // case: secret value doesn't match one in AWS parameter store
-        // -> update secret
-        await ssm
-          .putParameter({
-            Name: `${integration.path}${key}`,
-            Type: "SecureString",
-            Value: secrets[key].value,
-            Overwrite: true
-          })
-          .promise();
-      }
-    })
-  );
+      } else {
+        logger.info(
+          `getIntegrationSecrets: update secret in AWS SSM for [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}]`
+        );
 
-  // Identify secrets to delete
-  await Promise.all(
-    Object.keys(awsParameterStoreSecretsObj).map(async (key) => {
-      if (!(key in secrets)) {
-        // case:
-        // -> delete secret
-        await ssm
-          .deleteParameter({
-            Name: awsParameterStoreSecretsObj[key].Name as string
-          })
-          .promise();
-      }
-    })
-  );
+        const shouldUpdateKms =
+          areParametersKmsKeysFetched &&
+          Boolean(metadata.kmsKeyId) &&
+          awsParameterStoreSecretsObj[key].KeyId !== metadata.kmsKeyId;
 
-  AWS.config.update({
-    region: undefined,
-    accessKeyId: undefined,
-    secretAccessKey: undefined
-  });
+        // we ensure that the KMS key configured in the integration is applied for ALL parameters on AWS
+        if (secrets[key].value && (shouldUpdateKms || awsParameterStoreSecretsObj[key].Value !== secrets[key].value)) {
+          try {
+            await ssm
+              .putParameter({
+                Name: `${integration.path}${key}`,
+                Type: "SecureString",
+                Value: secrets[key].value,
+                Overwrite: true,
+                ...(metadata.kmsKeyId && { KeyId: metadata.kmsKeyId })
+              })
+              .promise();
+          } catch (error) {
+            (error as { secretKey: string }).secretKey = key;
+            throw error;
+          }
+        }
+
+        if (awsParameterStoreSecretsObj[key].Name) {
+          try {
+            await ssm
+              .addTagsToResource({
+                ResourceType: "Parameter",
+                ResourceId: awsParameterStoreSecretsObj[key].Name as string,
+                Tags: metadata.secretAWSTag
+                  ? metadata.secretAWSTag.map((tag: { key: string; value: string }) => ({
+                      Key: tag.key,
+                      Value: tag.value
+                    }))
+                  : []
+              })
+              .promise();
+          } catch (err) {
+            logger.error(
+              err,
+              `getIntegrationSecrets: update secret in AWS SSM for failed  [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}]`
+            );
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            if ((err as any).code === "AccessDeniedException") {
+              logger.error(
+                `AWS Parameter Store Error [integration=${integration.id}]: double check AWS account permissions (refer to the Infisical docs)`
+              );
+            }
+
+            response = {
+              isSynced: false,
+              syncMessage: (err as AWSError)?.message || "Error syncing with AWS Parameter Store"
+            };
+          }
+        }
+      }
+
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+    }
+  }
+
+  if (!metadata.shouldDisableDelete) {
+    logger.info(
+      `getIntegrationSecrets: inside of shouldDisableDelete AWS SSM [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}] [step=1]`
+    );
+    for (const key in awsParameterStoreSecretsObj) {
+      if (Object.hasOwn(awsParameterStoreSecretsObj, key)) {
+        logger.info(
+          `getIntegrationSecrets: inside of shouldDisableDelete AWS SSM [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}] [step=2]`
+        );
+        if (!(key in secrets) || !secrets[key].value) {
+          logger.info(
+            `getIntegrationSecrets: inside of shouldDisableDelete AWS SSM [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}] [step=3]`
+          );
+          // case:
+          // -> delete secret
+          await ssm
+            .deleteParameter({
+              Name: awsParameterStoreSecretsObj[key].Name as string
+            })
+            .promise();
+          logger.info(
+            `getIntegrationSecrets: inside of shouldDisableDelete AWS SSM [projectId=${projectId}] [environment=${integration.environment.slug}]  [secretPath=${integration.secretPath}] [step=4]`
+          );
+        }
+        await new Promise((resolve) => {
+          setTimeout(resolve, 50);
+        });
+      }
+    }
+  }
+
+  return response;
 };
 
 /**
@@ -529,72 +1091,223 @@ const syncSecretsAWSSecretManager = async ({
   integration,
   secrets,
   accessId,
-  accessToken
+  accessToken,
+  awsAssumeRoleArn,
+  projectId
 }: {
   integration: TIntegrations;
-  secrets: Record<string, { value: string; comment?: string }>;
+  secrets: Record<string, { value: string; comment?: string; secretMetadata?: ResourceMetadataDTO }>;
   accessId: string | null;
   accessToken: string;
+  awsAssumeRoleArn: string | null;
+  projectId?: string;
 }) => {
-  let secretsManager;
-  const secKeyVal = getSecretKeyValuePair(secrets);
-  try {
-    if (!accessId) return;
+  const appCfg = getConfig();
+  const metadata = IntegrationMetadataSchema.parse(integration.metadata || {});
 
-    AWS.config.update({
+  if (!accessId && !awsAssumeRoleArn) {
+    throw new Error("AWS access ID/AWS Assume Role is required");
+  }
+
+  let accessKeyId = "";
+  let secretAccessKey = "";
+  let sessionToken;
+  if (awsAssumeRoleArn) {
+    const client = new STSClient({
       region: integration.region as string,
-      accessKeyId: accessId,
-      secretAccessKey: accessToken
+      credentials:
+        appCfg.CLIENT_ID_AWS_INTEGRATION && appCfg.CLIENT_SECRET_AWS_INTEGRATION
+          ? {
+              accessKeyId: appCfg.CLIENT_ID_AWS_INTEGRATION,
+              secretAccessKey: appCfg.CLIENT_SECRET_AWS_INTEGRATION
+            }
+          : undefined
     });
-
-    secretsManager = new SecretsManagerClient({
-      region: integration.region as string,
-      credentials: {
-        accessKeyId: accessId,
-        secretAccessKey: accessToken
-      }
+    const command = new AssumeRoleCommand({
+      RoleArn: awsAssumeRoleArn,
+      RoleSessionName: `infisical-sm-${randomUUID()}`,
+      DurationSeconds: 900, // 15mins
+      ExternalId: projectId
     });
+    const response = await client.send(command);
+    if (!response.Credentials?.AccessKeyId || !response.Credentials?.SecretAccessKey)
+      throw new Error("Failed to assume role");
+    accessKeyId = response.Credentials?.AccessKeyId;
+    secretAccessKey = response.Credentials?.SecretAccessKey;
+    sessionToken = response.Credentials?.SessionToken;
+  } else {
+    accessKeyId = accessId as string;
+    secretAccessKey = accessToken;
+  }
 
-    const awsSecretManagerSecret = await secretsManager.send(
-      new GetSecretValueCommand({
-        SecretId: integration.app as string
-      })
+  const secretsManager = new SecretsManagerClient({
+    region: integration.region as string,
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+      sessionToken
+    }
+  });
+
+  const processAwsSecret = async (
+    secretId: string,
+    secretValue: Record<string, string | null | undefined> | string,
+    secretMetadata?: ResourceMetadataDTO
+  ) => {
+    const secretAWSTag = metadata.secretAWSTag as { key: string; value: string }[] | undefined;
+    const shouldTag =
+      (secretAWSTag && secretAWSTag.length) ||
+      (metadata.metadataSyncMode === IntegrationMetadataSyncMode.SECRET_METADATA &&
+        metadata.mappingBehavior === IntegrationMappingBehavior.ONE_TO_ONE);
+    const tagArray =
+      (metadata.metadataSyncMode === IntegrationMetadataSyncMode.SECRET_METADATA ? secretMetadata : secretAWSTag) ?? [];
+
+    const integrationTagObj = tagArray.reduce(
+      (acc, item) => {
+        acc[item.key] = item.value;
+        return acc;
+      },
+      {} as Record<string, string>
     );
 
-    let awsSecretManagerSecretObj: { [key: string]: AWS.SecretsManager } = {};
-
-    if (awsSecretManagerSecret?.SecretString) {
-      awsSecretManagerSecretObj = JSON.parse(awsSecretManagerSecret.SecretString);
-    }
-
-    if (!isEqual(awsSecretManagerSecretObj, secKeyVal)) {
-      await secretsManager.send(
-        new UpdateSecretCommand({
-          SecretId: integration.app as string,
-          SecretString: JSON.stringify(secKeyVal)
+    try {
+      const awsSecretManagerSecret = await secretsManager.send(
+        new GetSecretValueCommand({
+          SecretId: secretId
         })
       );
-    }
 
-    AWS.config.update({
-      region: undefined,
-      accessKeyId: undefined,
-      secretAccessKey: undefined
-    });
-  } catch (err) {
-    if (err instanceof ResourceNotFoundException && secretsManager) {
-      await secretsManager.send(
-        new CreateSecretCommand({
-          Name: integration.app as string,
-          SecretString: JSON.stringify(secKeyVal)
-        })
-      );
+      let secretToCompare;
+      if (awsSecretManagerSecret?.SecretString) {
+        if (typeof secretValue === "string") {
+          secretToCompare = awsSecretManagerSecret.SecretString;
+        } else {
+          secretToCompare = JSON.parse(awsSecretManagerSecret.SecretString);
+        }
+      }
+
+      if (!isEqual(secretToCompare, secretValue)) {
+        if (secretValue) {
+          await secretsManager.send(
+            new UpdateSecretCommand({
+              SecretId: secretId,
+              SecretString: typeof secretValue === "string" ? secretValue : JSON.stringify(secretValue)
+            })
+          );
+          // delete it
+        } else {
+          await secretsManager.send(
+            new DeleteSecretCommand({
+              SecretId: secretId,
+              ForceDeleteWithoutRecovery: true
+            })
+          );
+        }
+      }
+
+      if (shouldTag) {
+        const describedSecret = await secretsManager.send(
+          // requires secretsmanager:DescribeSecret policy
+          new DescribeSecretCommand({
+            SecretId: secretId
+          })
+        );
+
+        if (!describedSecret.Tags) return;
+
+        const awsTagObj = (describedSecret.Tags || []).reduce(
+          (acc, item) => {
+            if (item.Key && item.Value) {
+              acc[item.Key] = item.Value;
+            }
+            return acc;
+          },
+          {} as Record<string, string>
+        );
+
+        const tagsToUpdate: { Key: string; Value: string }[] = [];
+        const tagsToDelete: { Key: string; Value: string }[] = [];
+
+        describedSecret.Tags?.forEach((tag) => {
+          if (tag.Key && tag.Value) {
+            if (!(tag.Key in integrationTagObj)) {
+              // delete tag from AWS secret manager
+              tagsToDelete.push({
+                Key: tag.Key,
+                Value: tag.Value
+              });
+            } else if (tag.Value !== integrationTagObj[tag.Key]) {
+              // update tag in AWS secret manager
+              tagsToUpdate.push({
+                Key: tag.Key,
+                Value: integrationTagObj[tag.Key]
+              });
+            }
+          }
+        });
+
+        tagArray.forEach((tag) => {
+          if (!(tag.key in awsTagObj)) {
+            // create tag in AWS secret manager
+            tagsToUpdate.push({
+              Key: tag.key,
+              Value: tag.value
+            });
+          }
+        });
+
+        if (tagsToUpdate.length) {
+          await secretsManager.send(
+            new TagResourceCommand({
+              SecretId: secretId,
+              Tags: tagsToUpdate
+            })
+          );
+        }
+
+        if (tagsToDelete.length) {
+          await secretsManager.send(
+            new UntagResourceCommand({
+              SecretId: secretId,
+              TagKeys: tagsToDelete.map((tag) => tag.Key)
+            })
+          );
+        }
+      }
+    } catch (err) {
+      // case 1: when AWS manager can't find the specified secret
+      if (err instanceof ResourceNotFoundException && secretsManager) {
+        if (secretValue) {
+          await secretsManager.send(
+            new CreateSecretCommand({
+              Name: secretId,
+              SecretString: typeof secretValue === "string" ? secretValue : JSON.stringify(secretValue),
+              ...(metadata.kmsKeyId && { KmsKeyId: metadata.kmsKeyId }),
+              Tags: shouldTag
+                ? tagArray.map((tag: { key: string; value: string }) => ({
+                    Key: tag.key,
+                    Value: tag.value
+                  }))
+                : []
+            })
+          );
+        }
+        // case 2: something unexpected went wrong, so we'll throw the error to reflect the error in the integration sync status
+      } else {
+        throw err;
+      }
     }
-    AWS.config.update({
-      region: undefined,
-      accessKeyId: undefined,
-      secretAccessKey: undefined
-    });
+  };
+
+  if (metadata.mappingBehavior === IntegrationMappingBehavior.ONE_TO_ONE) {
+    for await (const [key, value] of Object.entries(secrets)) {
+      await processAwsSecret(key, value.value, value.secretMetadata).catch((error) => {
+        error.secretKey = key;
+        throw error;
+      });
+    }
+  } else {
+    await processAwsSecret(integration.app as string, getSecretKeyValuePair(secrets));
   }
 };
 
@@ -602,11 +1315,23 @@ const syncSecretsAWSSecretManager = async ({
  * Sync/push [secrets] to Heroku app named [integration.app]
  */
 const syncSecretsHeroku = async ({
+  createManySecretsRawFn,
+  updateManySecretsRawFn,
   integration,
   secrets,
   accessToken
 }: {
-  integration: TIntegrations;
+  createManySecretsRawFn: (params: TCreateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  updateManySecretsRawFn: (params: TUpdateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  integration: TIntegrations & {
+    projectId: string;
+    environment: {
+      id: string;
+      name: string;
+      slug: string;
+    };
+    secretPath: string;
+  };
   secrets: Record<string, { value: string; comment?: string } | null>;
   accessToken: string;
 }) => {
@@ -620,11 +1345,73 @@ const syncSecretsHeroku = async ({
     })
   ).data;
 
+  const secretsToAdd: { [key: string]: string } = {};
+  const secretsToUpdate: { [key: string]: string } = {};
+
+  const metadata = z.record(z.any()).parse(integration.metadata);
+
   Object.keys(herokuSecrets).forEach((key) => {
-    if (!(key in secrets)) {
-      secrets[key] = null;
-    }
+    if (!integration.lastUsed) {
+      // first time using integration
+      // -> apply initial sync behavior
+      switch (metadata.initialSyncBehavior) {
+        case IntegrationInitialSyncBehavior.OVERWRITE_TARGET: {
+          if (!(key in secrets)) secrets[key] = null;
+          break;
+        }
+        case IntegrationInitialSyncBehavior.PREFER_TARGET: {
+          if (!(key in secrets)) {
+            secretsToAdd[key] = herokuSecrets[key];
+          } else if (secrets[key]?.value !== herokuSecrets[key]) {
+            secretsToUpdate[key] = herokuSecrets[key];
+          }
+          secrets[key] = {
+            value: herokuSecrets[key]
+          };
+          break;
+        }
+        case IntegrationInitialSyncBehavior.PREFER_SOURCE: {
+          if (!(key in secrets)) {
+            secrets[key] = herokuSecrets[key];
+            secretsToAdd[key] = herokuSecrets[key];
+          }
+          break;
+        }
+        default: {
+          if (!(key in secrets)) secrets[key] = null;
+          break;
+        }
+      }
+    } else if (!(key in secrets)) secrets[key] = null;
   });
+
+  if (Object.keys(secretsToAdd).length) {
+    await createManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToAdd).map((key) => ({
+        secretName: key,
+        secretValue: secretsToAdd[key],
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
+    });
+  }
+
+  if (Object.keys(secretsToUpdate).length) {
+    await updateManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToUpdate).map((key) => ({
+        secretName: key,
+        secretValue: secretsToUpdate[key],
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
+    });
+  }
 
   await request.patch(
     `${IntegrationUrls.HEROKU_API_URL}/apps/${integration.app}/config-vars`,
@@ -643,14 +1430,24 @@ const syncSecretsHeroku = async ({
  * Sync/push [secrets] to Vercel project named [integration.app]
  */
 const syncSecretsVercel = async ({
+  createManySecretsRawFn,
   integration,
   integrationAuth,
-  secrets,
+  secrets: infisicalSecrets,
   accessToken
 }: {
-  integration: TIntegrations;
+  createManySecretsRawFn: (params: TCreateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  integration: TIntegrations & {
+    projectId: string;
+    environment: {
+      id: string;
+      name: string;
+      slug: string;
+    };
+    secretPath: string;
+  };
   integrationAuth: TIntegrationAuths;
-  secrets: Record<string, { value: string; comment?: string }>;
+  secrets: Record<string, { value: string; comment?: string } | null>;
   accessToken: string;
 }) => {
   interface VercelSecret {
@@ -723,80 +1520,119 @@ const syncSecretsVercel = async ({
     }
   }
 
-  const updateSecrets: VercelSecret[] = [];
-  const deleteSecrets: VercelSecret[] = [];
-  const newSecrets: VercelSecret[] = [];
+  const metadata = IntegrationMetadataSchema.parse(integration.metadata);
 
-  // Identify secrets to create
-  Object.keys(secrets).forEach((key) => {
-    if (!(key in res)) {
-      // case: secret has been created
-      newSecrets.push({
-        key,
-        value: secrets[key].value,
-        type: "encrypted",
-        target: [integration.targetEnvironment as string],
-        ...(integration.path
-          ? {
-              gitBranch: integration.path
-            }
-          : {})
-      });
+  // Default to overwrite target for old integrations that doesn't have a initial sync behavior set.
+  if (!metadata.initialSyncBehavior) {
+    metadata.initialSyncBehavior = IntegrationInitialSyncBehavior.OVERWRITE_TARGET;
+  }
+
+  const secretsToAddToInfisical: { [key: string]: VercelSecret } = {};
+
+  Object.keys(res).forEach((vercelKey) => {
+    if (!integration.lastUsed) {
+      // first time using integration
+      // -> apply initial sync behavior
+      switch (metadata.initialSyncBehavior) {
+        // Override all the secrets in Vercel
+        case IntegrationInitialSyncBehavior.OVERWRITE_TARGET: {
+          if (!(vercelKey in infisicalSecrets)) infisicalSecrets[vercelKey] = null;
+          break;
+        }
+        case IntegrationInitialSyncBehavior.PREFER_SOURCE: {
+          // if the vercel secret is not in infisical, we need to add it to infisical
+          if (!(vercelKey in infisicalSecrets)) {
+            infisicalSecrets[vercelKey] = {
+              value: res[vercelKey].value
+            };
+            secretsToAddToInfisical[vercelKey] = res[vercelKey];
+          }
+          break;
+        }
+        default: {
+          throw new Error(`Invalid initial sync behavior: ${metadata.initialSyncBehavior}`);
+        }
+      }
+    } else if (!(vercelKey in infisicalSecrets)) {
+      infisicalSecrets[vercelKey] = null;
     }
   });
 
-  // Identify secrets to update and delete
-  Object.keys(res).forEach((key) => {
-    if (key in secrets) {
-      if (res[key].value !== secrets[key].value) {
-        // case: secret value has changed
-        updateSecrets.push({
-          id: res[key].id,
-          key,
-          value: secrets[key].value,
-          type: res[key].type,
-          target: res[key].target.includes(integration.targetEnvironment as string)
-            ? [...res[key].target]
-            : [...res[key].target, integration.targetEnvironment as string],
-          ...(integration.path
-            ? {
-                gitBranch: integration.path
-              }
-            : {})
-        });
-      }
-    } else {
-      // case: secret has been deleted
-      deleteSecrets.push({
-        id: res[key].id,
-        key,
-        value: res[key].value,
-        type: "encrypted", // value doesn't matter
-        target: [integration.targetEnvironment as string],
-        ...(integration.path
-          ? {
-              gitBranch: integration.path
-            }
-          : {})
-      });
-    }
-  });
-
-  // Sync/push new secrets
-  if (newSecrets.length > 0) {
-    await request.post(`${IntegrationUrls.VERCEL_API_URL}/v10/projects/${integration.app}/env`, newSecrets, {
-      params,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Accept-Encoding": "application/json"
-      }
+  if (Object.keys(secretsToAddToInfisical).length) {
+    await createManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToAddToInfisical).map((key) => ({
+        secretName: key,
+        secretValue: secretsToAddToInfisical[key].value,
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
     });
   }
 
-  for await (const secret of updateSecrets) {
-    if (secret.type !== "sensitive") {
-      const { id, ...updatedSecret } = secret;
-      await request.patch(`${IntegrationUrls.VERCEL_API_URL}/v9/projects/${integration.app}/env/${id}`, updatedSecret, {
+  // update and create logic
+  for await (const key of Object.keys(infisicalSecrets)) {
+    if (!(key in res) || infisicalSecrets[key]?.value !== res[key].value) {
+      // if the key is not in the vercel res, we need to create it
+      if (!(key in res)) {
+        await request.post(
+          `${IntegrationUrls.VERCEL_API_URL}/v10/projects/${integration.app}/env`,
+          {
+            key,
+            value: infisicalSecrets[key]?.value,
+            type: "encrypted",
+            target: [integration.targetEnvironment as string],
+            ...(integration.path
+              ? {
+                  gitBranch: integration.path
+                }
+              : {})
+          },
+          {
+            params,
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Accept-Encoding": "application/json"
+            }
+          }
+        );
+
+        // Else if the key already exists and its not sensitive, we need to update it
+      } else if (res[key].type !== "sensitive") {
+        await request.patch(
+          `${IntegrationUrls.VERCEL_API_URL}/v9/projects/${integration.app}/env/${res[key].id}`,
+          {
+            key,
+            value: infisicalSecrets[key]?.value,
+            type: res[key].type,
+            target: res[key].target.includes(integration.targetEnvironment as string)
+              ? [...res[key].target]
+              : [...res[key].target, integration.targetEnvironment as string],
+            ...(integration.path
+              ? {
+                  gitBranch: integration.path
+                }
+              : {})
+          },
+          {
+            params,
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Accept-Encoding": "application/json"
+            }
+          }
+        );
+      }
+    }
+  }
+
+  // delete logic
+  for await (const key of Object.keys(res)) {
+    if (infisicalSecrets[key] === null) {
+      // case: delete secret
+      await request.delete(`${IntegrationUrls.VERCEL_API_URL}/v9/projects/${integration.app}/env/${res[key].id}`, {
         params,
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -804,16 +1640,6 @@ const syncSecretsVercel = async ({
         }
       });
     }
-  }
-
-  for await (const secret of deleteSecrets) {
-    await request.delete(`${IntegrationUrls.VERCEL_API_URL}/v9/projects/${integration.app}/env/${secret.id}`, {
-      params,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Accept-Encoding": "application/json"
-      }
-    });
   }
 };
 
@@ -1036,11 +1862,13 @@ const syncSecretsNetlify = async ({
  */
 const syncSecretsGitHub = async ({
   integration,
+  integrationAuth,
   secrets,
   accessToken,
   appendices
 }: {
   integration: TIntegrations;
+  integrationAuth: TIntegrationAuths;
   secrets: Record<string, { value: string; comment?: string }>;
   accessToken: string;
   appendices?: { prefix: string; suffix: string };
@@ -1048,98 +1876,198 @@ const syncSecretsGitHub = async ({
   interface GitHubRepoKey {
     key_id: string;
     key: string;
+    id?: number | undefined;
+    url?: string | undefined;
+    title?: string | undefined;
+    created_at?: string | undefined;
   }
 
   interface GitHubSecret {
     name: string;
     created_at: string;
     updated_at: string;
+    visibility?: "all" | "private" | "selected";
+    selected_repositories_url?: string | undefined;
   }
 
-  interface GitHubSecretRes {
-    [index: string]: GitHubSecret;
+  const authMetadata = IntegrationAuthMetadataSchema.parse(integrationAuth.metadata || {});
+  let octokit: Octokit;
+  const appCfg = getConfig();
+
+  if (authMetadata.installationId) {
+    octokit = new Octokit({
+      authStrategy: createAppAuth,
+      auth: {
+        appId: appCfg.CLIENT_APP_ID_GITHUB_APP,
+        privateKey: appCfg.CLIENT_PRIVATE_KEY_GITHUB_APP,
+        installationId: authMetadata.installationId
+      }
+    });
+  } else {
+    octokit = new Octokit({
+      auth: accessToken
+    });
   }
 
-  const octokit = new Octokit({
-    auth: accessToken
-  });
+  enum GithubScope {
+    Repo = "github-repo",
+    Org = "github-org",
+    Env = "github-env"
+  }
 
-  // const user = (await octokit.request('GET /user', {})).data;
-  const repoPublicKey: GitHubRepoKey = (
-    await octokit.request("GET /repos/{owner}/{repo}/actions/secrets/public-key", {
-      owner: integration.owner as string,
-      repo: integration.app as string
-    })
-  ).data;
+  let repoPublicKey: GitHubRepoKey;
+
+  switch (integration.scope) {
+    case GithubScope.Org: {
+      const { data } = await octokit.request("GET /orgs/{org}/actions/secrets/public-key", {
+        org: integration.owner as string
+      });
+      repoPublicKey = data;
+      break;
+    }
+    case GithubScope.Env: {
+      const { data } = await octokit.request(
+        "GET /repositories/{repository_id}/environments/{environment_name}/secrets/public-key",
+        {
+          repository_id: Number(integration.appId),
+          environment_name: integration.targetEnvironmentId as string
+        }
+      );
+      repoPublicKey = data;
+      break;
+    }
+    default: {
+      const { data } = await octokit.request("GET /repos/{owner}/{repo}/actions/secrets/public-key", {
+        owner: integration.owner as string,
+        repo: integration.app as string
+      });
+      repoPublicKey = data;
+      break;
+    }
+  }
 
   // Get local copy of decrypted secrets. We cannot decrypt them as we dont have access to GH private key
-  let encryptedSecrets: GitHubSecretRes = (
-    await octokit.request("GET /repos/{owner}/{repo}/actions/secrets", {
-      owner: integration.owner as string,
-      repo: integration.app as string
-    })
-  ).data.secrets.reduce(
-    (obj, secret) => ({
-      ...obj,
-      [secret.name]: secret
-    }),
-    {}
-  );
+  let encryptedSecrets: GitHubSecret[];
 
-  encryptedSecrets = Object.keys(encryptedSecrets).reduce(
-    (
-      result: {
-        [key: string]: GitHubSecret;
-      },
-      key
-    ) => {
+  switch (integration.scope) {
+    case GithubScope.Org: {
+      encryptedSecrets = (
+        await octokit.request("GET /orgs/{org}/actions/secrets", {
+          org: integration.owner as string
+        })
+      ).data.secrets;
+      break;
+    }
+    case GithubScope.Env: {
+      encryptedSecrets = (
+        await octokit.request("GET /repositories/{repository_id}/environments/{environment_name}/secrets", {
+          repository_id: Number(integration.appId),
+          environment_name: integration.targetEnvironmentId as string
+        })
+      ).data.secrets;
+      break;
+    }
+    default: {
+      encryptedSecrets = (
+        await octokit.request("GET /repos/{owner}/{repo}/actions/secrets", {
+          owner: integration.owner as string,
+          repo: integration.app as string
+        })
+      ).data.secrets;
+      break;
+    }
+  }
+
+  const metadata = IntegrationMetadataSchema.parse(integration.metadata);
+  if (metadata.shouldEnableDelete) {
+    for await (const encryptedSecret of encryptedSecrets) {
       if (
-        (appendices?.prefix !== undefined ? key.startsWith(appendices?.prefix) : true) &&
-        (appendices?.suffix !== undefined ? key.endsWith(appendices?.suffix) : true)
+        !(encryptedSecret.name in secrets) &&
+        !(appendices?.prefix !== undefined && !encryptedSecret.name.startsWith(appendices?.prefix)) &&
+        !(appendices?.suffix !== undefined && !encryptedSecret.name.endsWith(appendices?.suffix))
       ) {
-        result[key] = encryptedSecrets[key];
+        switch (integration.scope) {
+          case GithubScope.Org: {
+            await octokit.request("DELETE /orgs/{org}/actions/secrets/{secret_name}", {
+              org: integration.owner as string,
+              secret_name: encryptedSecret.name
+            });
+            break;
+          }
+          case GithubScope.Env: {
+            await octokit.request(
+              "DELETE /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}",
+              {
+                repository_id: Number(integration.appId),
+                environment_name: integration.targetEnvironmentId as string,
+                secret_name: encryptedSecret.name
+              }
+            );
+            break;
+          }
+          default: {
+            await octokit.request("DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}", {
+              owner: integration.owner as string,
+              repo: integration.app as string,
+              secret_name: encryptedSecret.name
+            });
+            break;
+          }
+        }
       }
-      return result;
-    },
-    {}
-  );
+    }
+  }
 
-  await Promise.all(
-    Object.keys(encryptedSecrets).map(async (key) => {
-      if (!(key in secrets)) {
-        return octokit.request("DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}", {
-          owner: integration.owner as string,
-          repo: integration.app as string,
-          secret_name: key
-        });
+  await sodium.ready.then(async () => {
+    for await (const key of Object.keys(secrets)) {
+      // convert secret & base64 key to Uint8Array.
+      const binkey = sodium.from_base64(repoPublicKey.key, sodium.base64_variants.ORIGINAL);
+      const binsec = sodium.from_string(secrets[key].value);
+
+      // encrypt secret using libsodium
+      const encBytes = sodium.crypto_box_seal(binsec, binkey);
+
+      // convert encrypted Uint8Array to base64
+      const encryptedSecret = sodium.to_base64(encBytes, sodium.base64_variants.ORIGINAL);
+
+      switch (integration.scope) {
+        case GithubScope.Org:
+          await octokit.request("PUT /orgs/{org}/actions/secrets/{secret_name}", {
+            org: integration.owner as string,
+            secret_name: key,
+            visibility: metadata.githubVisibility ?? "all",
+            ...(metadata.githubVisibility === "selected" && {
+              // we need to map the githubVisibilityRepoIds to numbers
+              selected_repository_ids: metadata.githubVisibilityRepoIds?.map(Number) ?? []
+            }),
+            encrypted_value: encryptedSecret,
+            key_id: repoPublicKey.key_id
+          });
+          break;
+        case GithubScope.Env:
+          await octokit.request(
+            "PUT /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}",
+            {
+              repository_id: Number(integration.appId),
+              environment_name: integration.targetEnvironmentId as string,
+              secret_name: key,
+              encrypted_value: encryptedSecret,
+              key_id: repoPublicKey.key_id
+            }
+          );
+          break;
+        default:
+          await octokit.request("PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}", {
+            owner: integration.owner as string,
+            repo: integration.app as string,
+            secret_name: key,
+            encrypted_value: encryptedSecret,
+            key_id: repoPublicKey.key_id
+          });
+          break;
       }
-    })
-  );
-
-  await Promise.all(
-    Object.keys(secrets).map((key) => {
-      // let encryptedSecret;
-      return sodium.ready.then(async () => {
-        // convert secret & base64 key to Uint8Array.
-        const binkey = sodium.from_base64(repoPublicKey.key, sodium.base64_variants.ORIGINAL);
-        const binsec = sodium.from_string(secrets[key].value);
-
-        // encrypt secret using libsodium
-        const encBytes = sodium.crypto_box_seal(binsec, binkey);
-
-        // convert encrypted Uint8Array to base64
-        const encryptedSecret = sodium.to_base64(encBytes, sodium.base64_variants.ORIGINAL);
-
-        await octokit.request("PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}", {
-          owner: integration.owner as string,
-          repo: integration.app as string,
-          secret_name: key,
-          encrypted_value: encryptedSecret,
-          key_id: repoPublicKey.key_id
-        });
-      });
-    })
-  );
+    }
+  });
 };
 
 /**
@@ -1167,6 +2095,22 @@ const syncSecretsRender = async ({
       }
     }
   );
+
+  if (integration.metadata) {
+    const metadata = z.record(z.any()).parse(integration.metadata);
+    if (metadata.shouldAutoRedeploy === true) {
+      await request.post(
+        `${IntegrationUrls.RENDER_API_URL}/v1/services/${integration.appId}/deploys`,
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Accept-Encoding": "application/json"
+          }
+        }
+      );
+    }
+  }
 };
 
 /**
@@ -1224,21 +2168,21 @@ const syncSecretsRailway = async ({
     }
   `;
 
-  const input = {
-    projectId: integration.appId,
-    environmentId: integration.targetEnvironmentId,
-    ...(integration.targetServiceId ? { serviceId: integration.targetServiceId } : {}),
-    replace: true,
-    variables: getSecretKeyValuePair(secrets)
+  const variables = {
+    input: {
+      projectId: integration.appId,
+      environmentId: integration.targetEnvironmentId,
+      ...(integration.targetServiceId ? { serviceId: integration.targetServiceId } : {}),
+      replace: true,
+      variables: getSecretKeyValuePair(secrets)
+    }
   };
 
   await request.post(
     IntegrationUrls.RAILWAY_API_URL,
     {
       query,
-      variables: {
-        input
-      }
+      variables
     },
     {
       headers: {
@@ -1395,58 +2339,241 @@ const syncSecretsCircleCI = async ({
   secrets: Record<string, { value: string; comment?: string }>;
   accessToken: string;
 }) => {
-  const circleciOrganizationDetail = (
-    await request.get(`${IntegrationUrls.CIRCLECI_API_URL}/v2/me/collaborations`, {
-      headers: {
-        "Circle-Token": accessToken,
-        "Accept-Encoding": "application/json"
+  if (integration.scope === CircleCiScope.Context) {
+    // sync secrets to CircleCI
+    await Promise.all(
+      Object.keys(secrets).map(async (key) =>
+        request.put(
+          `${IntegrationUrls.CIRCLECI_API_URL}/v2/context/${integration.appId}/environment-variable/${key}`,
+          {
+            value: secrets[key].value
+          },
+          {
+            headers: {
+              "Circle-Token": accessToken,
+              "Content-Type": "application/json"
+            }
+          }
+        )
+      )
+    );
+
+    // get secrets from CircleCI
+    const getSecretsRes = async () => {
+      type EnvVars = {
+        variable: string;
+        created_at: string;
+        updated_at: string;
+        context_id: string;
+      };
+
+      let nextPageToken: string | null | undefined;
+      const envVars: EnvVars[] = [];
+
+      while (nextPageToken !== null) {
+        const res = await request.get<{
+          items: EnvVars[];
+          next_page_token: string | null;
+        }>(`${IntegrationUrls.CIRCLECI_API_URL}/v2/context/${integration.appId}/environment-variable`, {
+          headers: {
+            "Circle-Token": accessToken,
+            "Accept-Encoding": "application/json"
+          },
+          params: nextPageToken
+            ? new URLSearchParams({
+                "page-token": nextPageToken
+              })
+            : undefined
+        });
+
+        envVars.push(...res.data.items);
+        nextPageToken = res.data.next_page_token;
       }
-    })
-  ).data[0];
 
-  const { slug } = circleciOrganizationDetail;
+      return envVars;
+    };
 
-  // sync secrets to CircleCI
-  await Promise.all(
-    Object.keys(secrets).map(async (key) =>
-      request.post(
-        `${IntegrationUrls.CIRCLECI_API_URL}/v2/project/${slug}/${integration.app}/envvar`,
-        {
-          name: key,
-          value: secrets[key].value
-        },
+    // delete secrets from CircleCI
+    await Promise.all(
+      (await getSecretsRes()).map(async (sec) => {
+        if (!(sec.variable in secrets)) {
+          return request.delete(
+            `${IntegrationUrls.CIRCLECI_API_URL}/v2/context/${integration.appId}/environment-variable/${sec.variable}`,
+            {
+              headers: {
+                "Circle-Token": accessToken,
+                "Content-Type": "application/json"
+              }
+            }
+          );
+        }
+      })
+    );
+  } else {
+    const getProjectSlug = async () => {
+      const requestConfig = {
+        headers: {
+          "Circle-Token": accessToken,
+          "Accept-Encoding": "application/json"
+        }
+      };
+
+      try {
+        const projectDetails = (
+          await request.get<{ slug: string }>(
+            `${IntegrationUrls.CIRCLECI_API_URL}/v2/project/${integration.appId}`,
+            requestConfig
+          )
+        ).data;
+
+        return projectDetails.slug;
+      } catch (err) {
+        if (err instanceof AxiosError) {
+          if (err.response?.data?.message !== "Not Found") {
+            throw new Error("Failed to get project slug from CircleCI during first attempt.");
+          }
+        }
+      }
+
+      // For backwards compatibility with old CircleCI integrations where we don't keep track of the organization name, so we can't filter by organization
+      try {
+        const circleCiOrganization = (
+          await request.get<{ slug: string; name: string }[]>(
+            `${IntegrationUrls.CIRCLECI_API_URL}/v2/me/collaborations`,
+            requestConfig
+          )
+        ).data;
+
+        // Case 1: This is a new integration where the organization name is stored under `integration.owner`
+        if (integration.owner) {
+          const org = circleCiOrganization.find((o) => o.name === integration.owner);
+          if (org) {
+            return `${org.slug}/${integration.app}`;
+          }
+        }
+
+        // Case 2: This is an old integration where the organization name is not stored, so we have to assume the first organization is the correct one
+        return `${circleCiOrganization[0].slug}/${integration.app}`;
+      } catch (err) {
+        throw new Error("Failed to get project slug from CircleCI during second attempt.");
+      }
+    };
+
+    const projectSlug = await getProjectSlug();
+
+    // sync secrets to CircleCI
+    await Promise.all(
+      Object.keys(secrets).map(async (key) =>
+        request.post(
+          `${IntegrationUrls.CIRCLECI_API_URL}/v2/project/${projectSlug}/envvar`,
+          {
+            name: key,
+            value: secrets[key].value
+          },
+          {
+            headers: {
+              "Circle-Token": accessToken,
+              "Content-Type": "application/json"
+            }
+          }
+        )
+      )
+    );
+
+    // get secrets from CircleCI
+    const getSecretsRes = (
+      await request.get<{ items: { name: string }[] }>(
+        `${IntegrationUrls.CIRCLECI_API_URL}/v2/project/${projectSlug}/envvar`,
         {
           headers: {
             "Circle-Token": accessToken,
-            "Content-Type": "application/json"
+            "Accept-Encoding": "application/json"
+          }
+        }
+      )
+    ).data?.items;
+
+    // delete secrets from CircleCI
+    await Promise.all(
+      getSecretsRes.map(async (sec) => {
+        if (!(sec.name in secrets)) {
+          return request.delete(`${IntegrationUrls.CIRCLECI_API_URL}/v2/project/${projectSlug}/envvar/${sec.name}`, {
+            headers: {
+              "Circle-Token": accessToken,
+              "Content-Type": "application/json"
+            }
+          });
+        }
+      })
+    );
+  }
+};
+
+/**
+ * Sync/push [secrets] to Databricks project
+ */
+const syncSecretsDatabricks = async ({
+  integration,
+  integrationAuth,
+  secrets,
+  accessToken
+}: {
+  integration: TIntegrations;
+  integrationAuth: TIntegrationAuths;
+  secrets: Record<string, { value: string; comment?: string }>;
+  accessToken: string;
+}) => {
+  const databricksApiUrl = `${integrationAuth.url}/api`;
+
+  // sync secrets to Databricks
+  await Promise.all(
+    Object.keys(secrets).map(async (key) =>
+      request.post(
+        `${databricksApiUrl}/2.0/secrets/put`,
+        {
+          scope: integration.app,
+          key,
+          string_value: secrets[key].value
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Accept-Encoding": "application/json"
           }
         }
       )
     )
   );
 
-  // get secrets from CircleCI
+  // get secrets from Databricks
   const getSecretsRes = (
-    await request.get<{ items: { name: string }[] }>(
-      `${IntegrationUrls.CIRCLECI_API_URL}/v2/project/${slug}/${integration.app}/envvar`,
+    await request.get<{ secrets: { key: string; last_updated_timestamp: number }[] }>(
+      `${databricksApiUrl}/2.0/secrets/list`,
       {
         headers: {
-          "Circle-Token": accessToken,
-          "Accept-Encoding": "application/json"
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        params: {
+          scope: integration.app
         }
       }
     )
-  ).data?.items;
+  ).data.secrets;
 
-  // delete secrets from CircleCI
+  // delete secrets from Databricks
   await Promise.all(
     getSecretsRes.map(async (sec) => {
-      if (!(sec.name in secrets)) {
-        return request.delete(
-          `${IntegrationUrls.CIRCLECI_API_URL}/v2/project/${slug}/${integration.app}/envvar/${sec.name}`,
+      if (!(sec.key in secrets)) {
+        return request.post(
+          `${databricksApiUrl}/2.0/secrets/delete`,
+          {
+            scope: integration.app,
+            key: sec.key
+          },
           {
             headers: {
-              "Circle-Token": accessToken,
+              Authorization: `Bearer ${accessToken}`,
               "Content-Type": "application/json"
             }
           }
@@ -1549,14 +2676,134 @@ const syncSecretsTravisCI = async ({
 /**
  * Sync/push [secrets] to GitLab repo with name [integration.app]
  */
-const syncSecretsGitLab = async ({
+const syncSecretsAzureDevops = async ({
   integrationAuth,
   integration,
   secrets,
   accessToken
 }: {
   integrationAuth: TIntegrationAuths;
-  integration: TIntegrations;
+  integration: TIntegrationsWithEnvironment;
+  secrets: Record<string, { value: string; comment?: string }>;
+  accessToken: string;
+}) => {
+  if (!integration.appId || !integration.app) {
+    throw new Error("Azure DevOps: orgId and projectId are required");
+  }
+  if (!integration.environment || !integration.environment.name) {
+    throw new Error("Azure DevOps: environment is required");
+  }
+  const headers = {
+    Authorization: `Basic ${accessToken}`
+  };
+  const azureDevopsApiUrl = integrationAuth.url ? `${integrationAuth.url}` : IntegrationUrls.AZURE_DEVOPS_API_URL;
+
+  const getEnvGroupId = async (orgId: string, project: string, env: string) => {
+    let groupId;
+    const url: string | null =
+      `${azureDevopsApiUrl}/${orgId}/${project}/_apis/distributedtask/variablegroups?api-version=7.2-preview.2`;
+
+    const response = await request.get(url, { headers });
+    for (const group of response.data.value) {
+      const groupName = group.name;
+      if (groupName === env) {
+        groupId = group.id;
+        return { groupId, groupName };
+      }
+    }
+    return { groupId: "", groupName: "" };
+  };
+
+  const { groupId, groupName } = await getEnvGroupId(integration.app, integration.appId, integration.environment.name);
+
+  const variables: Record<string, { value: string; isSecret: boolean }> = {};
+  for (const key of Object.keys(secrets)) {
+    variables[key] = { value: secrets[key].value, isSecret: true };
+  }
+
+  if (!groupId) {
+    // create new variable group if not present
+    const url = `${azureDevopsApiUrl}/${integration.app}/_apis/distributedtask/variablegroups?api-version=7.2-preview.2`;
+    const config = {
+      method: "POST",
+      url,
+      data: {
+        name: integration.environment.name,
+        description: integration.environment.name,
+        type: "Vsts",
+        owner: "Library",
+        variables,
+        variableGroupProjectReferences: [
+          {
+            name: integration.environment.name,
+            projectReference: {
+              name: integration.appId
+            }
+          }
+        ]
+      },
+      headers: {
+        headers
+      }
+    };
+
+    const res = await request.post(url, config.data, config.headers);
+    if (res.status !== 200) {
+      throw new Error(`Azure DevOps: Failed to create variable group: ${res.statusText}`);
+    }
+  } else {
+    // sync variables for pre-existing variable group
+    const url = `${azureDevopsApiUrl}/${integration.app}/_apis/distributedtask/variablegroups/${groupId}?api-version=7.2-preview.2`;
+    const config = {
+      method: "PUT",
+      url,
+      data: {
+        name: groupName,
+        description: groupName,
+        type: "Vsts",
+        owner: "Library",
+        variables,
+        variableGroupProjectReferences: [
+          {
+            name: groupName,
+            projectReference: {
+              name: integration.appId
+            }
+          }
+        ]
+      },
+      headers: {
+        headers
+      }
+    };
+    const res = await request.put(url, config.data, config.headers);
+    if (res.status !== 200) {
+      throw new Error(`Azure DevOps: Failed to update variable group: ${res.statusText}`);
+    }
+  }
+};
+
+/**
+ * Sync/push [secrets] to GitLab repo with name [integration.app]
+ */
+const syncSecretsGitLab = async ({
+  createManySecretsRawFn,
+  integrationAuth,
+  integration,
+  secrets,
+  accessToken
+}: {
+  createManySecretsRawFn: (params: TCreateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  integrationAuth: TIntegrationAuths;
+  integration: TIntegrations & {
+    projectId: string;
+    environment: {
+      id: string;
+      name: string;
+      slug: string;
+    };
+    secretPath: string;
+  };
   secrets: Record<string, { value: string; comment?: string }>;
   accessToken: string;
 }) => {
@@ -1595,13 +2842,13 @@ const syncSecretsGitLab = async ({
     return allEnvVariables;
   };
 
+  const metadata = IntegrationMetadataSchema.parse(integration.metadata);
   const allEnvVariables = await getAllEnvVariables(integration?.appId as string, accessToken);
   const getSecretsRes: GitLabSecret[] = allEnvVariables
     .filter((secret: GitLabSecret) => secret.environment_scope === integration.targetEnvironment)
     .filter((gitLabSecret) => {
       let isValid = true;
 
-      const metadata = z.record(z.any()).parse(integration.metadata);
       if (metadata.secretPrefix && !gitLabSecret.key.startsWith(metadata.secretPrefix)) {
         isValid = false;
       }
@@ -1613,6 +2860,81 @@ const syncSecretsGitLab = async ({
       return isValid;
     });
 
+  if (!integration.lastUsed) {
+    const secretsToAddToInfisical: { [key: string]: GitLabSecret } = {};
+    const secretsToRemoveInGitlab: GitLabSecret[] = [];
+
+    if (!metadata.initialSyncBehavior) {
+      metadata.initialSyncBehavior = IntegrationInitialSyncBehavior.OVERWRITE_TARGET;
+    }
+
+    getSecretsRes.forEach((gitlabSecret) => {
+      // first time using integration
+      // -> apply initial sync behavior
+      switch (metadata.initialSyncBehavior) {
+        // Override all the secrets in GitLab
+        case IntegrationInitialSyncBehavior.OVERWRITE_TARGET: {
+          if (!(gitlabSecret.key in secrets)) {
+            secretsToRemoveInGitlab.push(gitlabSecret);
+          }
+          break;
+        }
+        case IntegrationInitialSyncBehavior.PREFER_SOURCE: {
+          // if the secret is not in infisical, we need to add it to infisical
+          if (!(gitlabSecret.key in secrets)) {
+            secrets[gitlabSecret.key] = {
+              value: gitlabSecret.value
+            };
+            // need to remove prefix and suffix from what we're saving to Infisical
+            const prefix = metadata?.secretPrefix || "";
+            const suffix = metadata?.secretSuffix || "";
+            let processedKey = gitlabSecret.key;
+
+            // Remove prefix if it exists at the start
+            if (prefix && processedKey.startsWith(prefix)) {
+              processedKey = processedKey.slice(prefix.length);
+            }
+
+            // Remove suffix if it exists at the end
+            if (suffix && processedKey.endsWith(suffix)) {
+              processedKey = processedKey.slice(0, -suffix.length);
+            }
+
+            secretsToAddToInfisical[processedKey] = gitlabSecret;
+          }
+          break;
+        }
+        default: {
+          throw new Error(`Invalid initial sync behavior: ${metadata.initialSyncBehavior}`);
+        }
+      }
+    });
+
+    if (Object.keys(secretsToAddToInfisical).length) {
+      await createManySecretsRawFn({
+        projectId: integration.projectId,
+        environment: integration.environment.slug,
+        path: integration.secretPath,
+        secrets: Object.keys(secretsToAddToInfisical).map((key) => ({
+          secretName: key,
+          secretValue: secretsToAddToInfisical[key].value,
+          type: SecretType.Shared
+        }))
+      });
+    }
+
+    for await (const gitlabSecret of secretsToRemoveInGitlab) {
+      await request.delete(
+        `${gitLabApiUrl}/v4/projects/${integration?.appId}/variables/${gitlabSecret.key}?filter[environment_scope]=${integration.targetEnvironment}`,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`
+          }
+        }
+      );
+    }
+  }
+
   for await (const key of Object.keys(secrets)) {
     const existingSecret = getSecretsRes.find((s) => s.key === key);
     if (!existingSecret) {
@@ -1621,8 +2943,8 @@ const syncSecretsGitLab = async ({
         {
           key,
           value: secrets[key].value,
-          protected: false,
-          masked: false,
+          protected: Boolean(metadata.shouldProtectSecrets),
+          masked: Boolean(metadata.shouldMaskSecrets),
           raw: false,
           environment_scope: integration.targetEnvironment
         },
@@ -1639,7 +2961,9 @@ const syncSecretsGitLab = async ({
         `${gitLabApiUrl}/v4/projects/${integration?.appId}/variables/${existingSecret.key}?filter[environment_scope]=${integration.targetEnvironment}`,
         {
           ...existingSecret,
-          value: secrets[existingSecret.key].value
+          value: secrets[existingSecret.key].value,
+          protected: Boolean(metadata.shouldProtectSecrets),
+          masked: Boolean(metadata.shouldMaskSecrets)
         },
         {
           headers: {
@@ -1989,17 +3313,30 @@ const syncSecretsQovery = async ({
  * @param {String} obj.accessToken - access token for Terraform Cloud API
  */
 const syncSecretsTerraformCloud = async ({
+  createManySecretsRawFn,
+  updateManySecretsRawFn,
   integration,
   secrets,
-  accessToken
+  accessToken,
+  integrationDAL
 }: {
-  integration: TIntegrations;
-  secrets: Record<string, { value: string; comment?: string }>;
+  createManySecretsRawFn: (params: TCreateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  updateManySecretsRawFn: (params: TUpdateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  integration: TIntegrations & {
+    projectId: string;
+    environment: {
+      id: string;
+      name: string;
+      slug: string;
+    };
+  };
+  secrets: Record<string, { value: string; comment?: string } | null>;
   accessToken: string;
+  integrationDAL: Pick<TIntegrationDALFactory, "updateById">;
 }) => {
   // get secrets from Terraform Cloud
-  const getSecretsRes = (
-    await request.get<{ data: { attributes: { key: string; value: string }; id: string }[] }>(
+  const terraformSecrets = (
+    await request.get<{ data: { attributes: { key: string; value: string; sensitive: boolean }; id: string }[] }>(
       `${IntegrationUrls.TERRAFORM_CLOUD_API_URL}/api/v2/workspaces/${integration.appId}/vars`,
       {
         headers: {
@@ -2013,12 +3350,77 @@ const syncSecretsTerraformCloud = async ({
       ...obj,
       [secret.attributes.key]: secret
     }),
-    {} as Record<string, { attributes: { key: string; value: string }; id: string }>
+    {} as Record<string, { attributes: { key: string; value: string; sensitive: boolean }; id: string }>
   );
+
+  const secretsToAdd: { [key: string]: string } = {};
+  const secretsToUpdate: { [key: string]: string } = {};
+
+  const metadata = z.record(z.any()).parse(integration.metadata);
+
+  Object.keys(terraformSecrets).forEach((key) => {
+    if (!integration.lastUsed) {
+      // first time using integration
+      // -> apply initial sync behavior
+      switch (metadata.initialSyncBehavior) {
+        case IntegrationInitialSyncBehavior.PREFER_TARGET: {
+          if (!(key in secrets)) {
+            secretsToAdd[key] = terraformSecrets[key].attributes.value;
+          } else if (secrets[key]?.value !== terraformSecrets[key].attributes.value) {
+            secretsToUpdate[key] = terraformSecrets[key].attributes.value;
+          }
+          secrets[key] = {
+            value: terraformSecrets[key].attributes.value
+          };
+          break;
+        }
+        case IntegrationInitialSyncBehavior.PREFER_SOURCE: {
+          if (!(key in secrets)) {
+            secrets[key] = {
+              value: terraformSecrets[key].attributes.value
+            };
+            secretsToAdd[key] = terraformSecrets[key].attributes.value;
+          }
+          break;
+        }
+        default: {
+          break;
+        }
+      }
+    } else if (!(key in secrets)) secrets[key] = null;
+  });
+
+  if (Object.keys(secretsToAdd).length) {
+    await createManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToAdd).map((key) => ({
+        secretName: key,
+        secretValue: secretsToAdd[key],
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
+    });
+  }
+
+  if (Object.keys(secretsToUpdate).length) {
+    await updateManySecretsRawFn({
+      projectId: integration.projectId,
+      environment: integration.environment.slug,
+      path: integration.secretPath,
+      secrets: Object.keys(secretsToUpdate).map((key) => ({
+        secretName: key,
+        secretValue: secretsToUpdate[key],
+        type: SecretType.Shared,
+        secretComment: ""
+      }))
+    });
+  }
 
   // create or update secrets on Terraform Cloud
   for await (const key of Object.keys(secrets)) {
-    if (!(key in getSecretsRes)) {
+    if (!(key in terraformSecrets)) {
       // case: secret does not exist in Terraform Cloud
       // -> add secret
       await request.post(
@@ -2028,8 +3430,9 @@ const syncSecretsTerraformCloud = async ({
             type: "vars",
             attributes: {
               key,
-              value: secrets[key].value,
-              category: integration.targetService
+              value: secrets[key]?.value,
+              category: integration.targetService,
+              sensitive: true
             }
           }
         },
@@ -2042,17 +3445,22 @@ const syncSecretsTerraformCloud = async ({
         }
       );
       // case: secret exists in Terraform Cloud
-    } else if (secrets[key].value !== getSecretsRes[key].attributes.value) {
+    } else if (
+      // we now set secrets to sensitive in Terraform Cloud, this checks if existing secrets are not sensitive and updates them accordingly
+      !terraformSecrets[key].attributes.sensitive ||
+      secrets[key]?.value !== terraformSecrets[key].attributes.value
+    ) {
       // -> update secret
       await request.patch(
-        `${IntegrationUrls.TERRAFORM_CLOUD_API_URL}/api/v2/workspaces/${integration.appId}/vars/${getSecretsRes[key].id}`,
+        `${IntegrationUrls.TERRAFORM_CLOUD_API_URL}/api/v2/workspaces/${integration.appId}/vars/${terraformSecrets[key].id}`,
         {
           data: {
             type: "vars",
-            id: getSecretsRes[key].id,
+            id: terraformSecrets[key].id,
             attributes: {
-              ...getSecretsRes[key],
-              value: secrets[key].value
+              ...terraformSecrets[key],
+              value: secrets[key]?.value,
+              sensitive: true
             }
           }
         },
@@ -2067,11 +3475,11 @@ const syncSecretsTerraformCloud = async ({
     }
   }
 
-  for await (const key of Object.keys(getSecretsRes)) {
+  for await (const key of Object.keys(terraformSecrets)) {
     if (!(key in secrets)) {
       // case: delete secret
       await request.delete(
-        `${IntegrationUrls.TERRAFORM_CLOUD_API_URL}/api/v2/workspaces/${integration.appId}/vars/${getSecretsRes[key].id}`,
+        `${IntegrationUrls.TERRAFORM_CLOUD_API_URL}/api/v2/workspaces/${integration.appId}/vars/${terraformSecrets[key].id}`,
         {
           headers: {
             Authorization: `Bearer ${accessToken}`,
@@ -2082,6 +3490,10 @@ const syncSecretsTerraformCloud = async ({
       );
     }
   }
+
+  await integrationDAL.updateById(integration.id, {
+    lastUsed: new Date()
+  });
 };
 
 /**
@@ -2246,7 +3658,9 @@ const syncSecretsHashiCorpVault = async ({
   accessId: string | null;
   accessToken: string;
 }) => {
-  if (!accessId) return;
+  if (!accessId) {
+    throw new Error("Access ID is required");
+  }
 
   interface LoginAppRoleRes {
     auth: {
@@ -2317,18 +3731,21 @@ const syncSecretsCloudflarePages = async ({
     })
   ).data.result.deployment_configs[integration.targetEnvironment as string].env_vars;
 
-  // copy the secrets object, so we can set deleted keys to null
-  const secretsObj = Object.fromEntries(
-    Object.entries(getSecretKeyValuePair(secrets)).map(([key, val]) => [
-      key,
-      key in Object.keys(getSecretsRes) ? { type: "secret_text", value: val } : null
-    ])
-  );
+  let secretEntries: [string, object | null][] = Object.entries(getSecretKeyValuePair(secrets)).map(([key, val]) => [
+    key,
+    { type: "secret_text", value: val }
+  ]);
+
+  if (getSecretsRes) {
+    const toDeleteKeys = Object.keys(getSecretsRes).filter((key) => !Object.keys(secrets).includes(key));
+    const toDeleteEntries: [string, null][] = toDeleteKeys.map((key) => [key, null]);
+    secretEntries = [...secretEntries, ...toDeleteEntries];
+  }
 
   const data = {
     deployment_configs: {
       [integration.targetEnvironment as string]: {
-        env_vars: secretsObj
+        env_vars: Object.fromEntries(secretEntries)
       }
     }
   };
@@ -2343,6 +3760,31 @@ const syncSecretsCloudflarePages = async ({
       }
     }
   );
+
+  const metadata = z.record(z.any()).parse(integration.metadata);
+  if (metadata.shouldAutoRedeploy && integration.targetEnvironment === "production") {
+    await request
+      .post(
+        `${IntegrationUrls.CLOUDFLARE_PAGES_API_URL}/client/v4/accounts/${accessId}/pages/projects/${integration.app}/deployments`,
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: "application/json"
+          }
+        }
+      )
+      .catch((error) => {
+        if (error instanceof AxiosError && error.response?.status === 304) {
+          logger.info(
+            `syncSecretsCloudflarePages: CF pages redeployment returned status code 304 for integration [id=${integration.id}]`
+          );
+          return;
+        }
+
+        throw error;
+      });
+  }
 };
 
 /**
@@ -2467,7 +3909,14 @@ const syncSecretsBitBucket = async ({
   const res: { [key: string]: BitbucketVariable } = {};
 
   let hasNextPage = true;
-  let variablesUrl = `${IntegrationUrls.BITBUCKET_API_URL}/2.0/repositories/${integration.targetEnvironmentId}/${integration.appId}/pipelines_config/variables`;
+
+  const rootUrl = integration.targetServiceId
+    ? // scope: deployment environment
+      `${IntegrationUrls.BITBUCKET_API_URL}/2.0/repositories/${integration.targetEnvironmentId}/${integration.appId}/deployments_config/environments/${integration.targetServiceId}/variables`
+    : // scope: repository
+      `${IntegrationUrls.BITBUCKET_API_URL}/2.0/repositories/${integration.targetEnvironmentId}/${integration.appId}/pipelines_config/variables`;
+
+  let variablesUrl = rootUrl;
 
   while (hasNextPage) {
     const { data }: { data: VariablesResponse } = await request.get(variablesUrl, {
@@ -2494,7 +3943,7 @@ const syncSecretsBitBucket = async ({
     if (key in res) {
       // update existing secret
       await request.put(
-        `${variablesUrl}/${res[key].uuid}`,
+        `${rootUrl}/${res[key].uuid}`,
         {
           key,
           value: secrets[key].value,
@@ -2510,7 +3959,7 @@ const syncSecretsBitBucket = async ({
     } else {
       // create new secret
       await request.post(
-        variablesUrl,
+        rootUrl,
         {
           key,
           value: secrets[key].value,
@@ -2606,7 +4055,7 @@ const syncSecretsDigitalOceanAppPlatform = async ({
       spec: {
         name: integration.app,
         ...appSettings,
-        envs: Object.entries(secrets).map(([key, data]) => ({ key, value: data.value }))
+        envs: Object.entries(secrets).map(([key, data]) => ({ key, value: data.value, type: "SECRET" }))
       }
     },
     {
@@ -2948,24 +4397,178 @@ const syncSecretsHasuraCloud = async ({
   }
 };
 
+/** Sync/push [secrets] to Rundeck
+ * @param {Object} obj
+ * @param {TIntegrations} obj.integration - integration details
+ * @param {Object} obj.secrets - secrets to push to integration (object where keys are secret keys and values are secret values)
+ * @param {String} obj.accessToken - access token for Rundeck integration
+ */
+const syncSecretsRundeck = async ({
+  integration,
+  secrets,
+  accessToken
+}: {
+  integration: TIntegrations;
+  secrets: Record<string, { value: string; comment?: string }>;
+  accessToken: string;
+}) => {
+  interface RundeckSecretResource {
+    name: string;
+  }
+  interface RundeckSecretsGetRes {
+    resources: RundeckSecretResource[];
+  }
+
+  let existingRundeckSecrets: string[] = [];
+
+  try {
+    const listResult = await request.get<RundeckSecretsGetRes>(
+      `${integration.url}/api/44/storage/${integration.path}`,
+      {
+        headers: {
+          "X-Rundeck-Auth-Token": accessToken
+        }
+      }
+    );
+
+    existingRundeckSecrets = listResult.data.resources.map((res) => res.name);
+  } catch (err) {
+    logger.info("No existing rundeck secrets");
+  }
+
+  try {
+    for await (const [key, value] of Object.entries(secrets)) {
+      if (existingRundeckSecrets.includes(key)) {
+        await request.put(`${integration.url}/api/44/storage/${integration.path}/${key}`, value.value, {
+          headers: {
+            "X-Rundeck-Auth-Token": accessToken,
+            "Content-Type": "application/x-rundeck-data-password"
+          }
+        });
+      } else {
+        await request.post(`${integration.url}/api/44/storage/${integration.path}/${key}`, value.value, {
+          headers: {
+            "X-Rundeck-Auth-Token": accessToken,
+            "Content-Type": "application/x-rundeck-data-password"
+          }
+        });
+      }
+    }
+
+    for await (const existingSecret of existingRundeckSecrets) {
+      if (!(existingSecret in secrets)) {
+        await request.delete(`${integration.url}/api/44/storage/${integration.path}/${existingSecret}`, {
+          headers: {
+            "X-Rundeck-Auth-Token": accessToken
+          }
+        });
+      }
+    }
+  } catch (err: unknown) {
+    throw new Error(
+      `Ensure that the provided Rundeck URL is accessible by Infisical and that the linked API token has sufficient permissions.\n\n${
+        (err as Error).message
+      }`
+    );
+  }
+};
+
+const syncSecretsOctopusDeploy = async ({
+  integration,
+  integrationAuth,
+  secrets,
+  accessToken
+}: {
+  integration: TIntegrations;
+  integrationAuth: TIntegrationAuths;
+  secrets: Record<string, { value: string; comment?: string }>;
+  accessToken: string;
+}) => {
+  let url: string;
+  switch (integration.scope) {
+    case OctopusDeployScope.Project:
+      url = `${integrationAuth.url}/api/${integration.targetEnvironmentId}/projects/${integration.appId}/variables`;
+      break;
+    // future support tenant, variable set, etc.
+    default:
+      throw new InternalServerError({ message: `Unhandled Octopus Deploy scope: ${integration.scope}` });
+  }
+
+  // SDK doesn't support variable set...
+  const { data: variableSet } = await request.get<TOctopusDeployVariableSet>(url, {
+    headers: {
+      "X-NuGet-ApiKey": accessToken,
+      Accept: "application/json"
+    }
+  });
+
+  await request.put(
+    url,
+    {
+      ...variableSet,
+      Variables: Object.entries(secrets).map(([key, value]) => ({
+        Name: key,
+        Value: value.value,
+        Description: value.comment ?? "",
+        Scope:
+          (integration.metadata as { octopusDeployScopeValues: TOctopusDeployVariableSet["ScopeValues"] })
+            ?.octopusDeployScopeValues ?? {},
+        IsEditable: false,
+        Prompt: null,
+        Type: "String",
+        IsSensitive: true
+      }))
+    } as unknown as TOctopusDeployVariableSet,
+    {
+      headers: {
+        "X-NuGet-ApiKey": accessToken,
+        Accept: "application/json"
+      }
+    }
+  );
+};
+
 /**
  * Sync/push [secrets] to [app] in integration named [integration]
+ *
+ * Do this in terms of DAL
+ *
  */
 export const syncIntegrationSecrets = async ({
+  createManySecretsRawFn,
+  updateManySecretsRawFn,
+  integrationDAL,
   integration,
   integrationAuth,
   secrets,
   accessId,
   accessToken,
-  appendices
+  awsAssumeRoleArn,
+  appendices,
+  projectId
 }: {
-  integration: TIntegrations;
+  createManySecretsRawFn: (params: TCreateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  updateManySecretsRawFn: (params: TUpdateManySecretsRawFn) => Promise<Array<{ id: string }>>;
+  integrationDAL: Pick<TIntegrationDALFactory, "updateById">;
+  integration: TIntegrations & {
+    projectId: string;
+    environment: {
+      id: string;
+      name: string;
+      slug: string;
+    };
+    secretPath: string;
+  };
   integrationAuth: TIntegrationAuths;
-  secrets: Record<string, { value: string; comment?: string }>;
+  secrets: Record<string, { value: string; comment?: string; secretMetadata?: ResourceMetadataDTO }>;
   accessId: string | null;
+  awsAssumeRoleArn: string | null;
   accessToken: string;
   appendices?: { prefix: string; suffix: string };
+  projectId?: string;
 }) => {
+  let response: { isSynced: boolean; syncMessage: string } | null = null;
+
   switch (integration.integration) {
     case Integrations.GCP_SECRET_MANAGER:
       await syncSecretsGCPSecretManager({
@@ -2978,15 +4581,38 @@ export const syncIntegrationSecrets = async ({
       await syncSecretsAzureKeyVault({
         integration,
         secrets,
+        accessToken,
+        createManySecretsRawFn,
+        updateManySecretsRawFn
+      });
+      break;
+
+    case Integrations.AZURE_DEVOPS:
+      await syncSecretsAzureDevops({
+        integrationAuth,
+        integration,
+        secrets,
         accessToken
       });
       break;
+    case Integrations.AZURE_APP_CONFIGURATION:
+      await syncSecretsAzureAppConfig({
+        integration,
+        integrationDAL,
+        secrets,
+        accessToken,
+        createManySecretsRawFn,
+        updateManySecretsRawFn
+      });
+      break;
     case Integrations.AWS_PARAMETER_STORE:
-      await syncSecretsAWSParameterStore({
+      response = await syncSecretsAWSParameterStore({
         integration,
         secrets,
         accessId,
-        accessToken
+        accessToken,
+        awsAssumeRoleArn,
+        projectId
       });
       break;
     case Integrations.AWS_SECRET_MANAGER:
@@ -2994,11 +4620,15 @@ export const syncIntegrationSecrets = async ({
         integration,
         secrets,
         accessId,
-        accessToken
+        accessToken,
+        awsAssumeRoleArn,
+        projectId
       });
       break;
     case Integrations.HEROKU:
       await syncSecretsHeroku({
+        createManySecretsRawFn,
+        updateManySecretsRawFn,
         integration,
         secrets,
         accessToken
@@ -3009,7 +4639,8 @@ export const syncIntegrationSecrets = async ({
         integration,
         integrationAuth,
         secrets,
-        accessToken
+        accessToken,
+        createManySecretsRawFn
       });
       break;
     case Integrations.NETLIFY:
@@ -3023,6 +4654,7 @@ export const syncIntegrationSecrets = async ({
     case Integrations.GITHUB:
       await syncSecretsGitHub({
         integration,
+        integrationAuth,
         secrets,
         accessToken,
         appendices
@@ -3033,7 +4665,8 @@ export const syncIntegrationSecrets = async ({
         integrationAuth,
         integration,
         secrets,
-        accessToken
+        accessToken,
+        createManySecretsRawFn
       });
       break;
     case Integrations.RENDER:
@@ -3060,6 +4693,14 @@ export const syncIntegrationSecrets = async ({
     case Integrations.CIRCLECI:
       await syncSecretsCircleCI({
         integration,
+        secrets,
+        accessToken
+      });
+      break;
+    case Integrations.DATABRICKS:
+      await syncSecretsDatabricks({
+        integration,
+        integrationAuth,
         secrets,
         accessToken
       });
@@ -3103,9 +4744,12 @@ export const syncIntegrationSecrets = async ({
       break;
     case Integrations.TERRAFORM_CLOUD:
       await syncSecretsTerraformCloud({
+        createManySecretsRawFn,
+        updateManySecretsRawFn,
         integration,
         secrets,
-        accessToken
+        accessToken,
+        integrationDAL
       });
       break;
     case Integrations.HASHICORP_VAULT:
@@ -3191,7 +4835,24 @@ export const syncIntegrationSecrets = async ({
         accessToken
       });
       break;
+    case Integrations.RUNDECK:
+      await syncSecretsRundeck({
+        integration,
+        secrets,
+        accessToken
+      });
+      break;
+    case Integrations.OCTOPUS_DEPLOY:
+      await syncSecretsOctopusDeploy({
+        integration,
+        integrationAuth,
+        secrets,
+        accessToken
+      });
+      break;
     default:
       throw new BadRequestError({ message: "Invalid integration" });
   }
+
+  return response;
 };

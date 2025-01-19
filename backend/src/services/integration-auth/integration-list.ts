@@ -15,6 +15,7 @@ export enum Integrations {
   FLYIO = "flyio",
   LARAVELFORGE = "laravel-forge",
   CIRCLECI = "circleci",
+  DATABRICKS = "databricks",
   TRAVISCI = "travisci",
   TEAMCITY = "teamcity",
   SUPABASE = "supabase",
@@ -30,11 +31,26 @@ export enum Integrations {
   DIGITAL_OCEAN_APP_PLATFORM = "digital-ocean-app-platform",
   CLOUD_66 = "cloud-66",
   NORTHFLANK = "northflank",
-  HASURA_CLOUD = "hasura-cloud"
+  HASURA_CLOUD = "hasura-cloud",
+  RUNDECK = "rundeck",
+  AZURE_DEVOPS = "azure-devops",
+  AZURE_APP_CONFIGURATION = "azure-app-configuration",
+  OCTOPUS_DEPLOY = "octopus-deploy"
 }
 
 export enum IntegrationType {
   OAUTH2 = "oauth2"
+}
+
+export enum IntegrationInitialSyncBehavior {
+  OVERWRITE_TARGET = "overwrite-target",
+  PREFER_TARGET = "prefer-target",
+  PREFER_SOURCE = "prefer-source"
+}
+
+export enum IntegrationMappingBehavior {
+  ONE_TO_ONE = "one-to-one",
+  MANY_TO_ONE = "many-to-one"
 }
 
 export enum IntegrationUrls {
@@ -76,11 +92,14 @@ export enum IntegrationUrls {
   CLOUD_66_API_URL = "https://app.cloud66.com/api",
   NORTHFLANK_API_URL = "https://api.northflank.com",
   HASURA_CLOUD_API_URL = "https://data.pro.hasura.io/v1/graphql",
+  AZURE_DEVOPS_API_URL = "https://dev.azure.com",
 
   GCP_SECRET_MANAGER_SERVICE_NAME = "secretmanager.googleapis.com",
   GCP_SECRET_MANAGER_URL = `https://${GCP_SECRET_MANAGER_SERVICE_NAME}`,
   GCP_SERVICE_USAGE_URL = "https://serviceusage.googleapis.com",
-  GCP_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+  GCP_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform",
+
+  GITHUB_USER_INSTALLATIONS = "https://api.github.com/user/installations"
 }
 
 export const getIntegrationOptions = async () => {
@@ -122,6 +141,7 @@ export const getIntegrationOptions = async () => {
       isAvailable: true,
       type: "oauth",
       clientId: appCfg.CLIENT_ID_GITHUB,
+      clientSlug: appCfg.CLIENT_SLUG_GITHUB_APP,
       docsLink: ""
     },
     {
@@ -188,9 +208,27 @@ export const getIntegrationOptions = async () => {
       docsLink: ""
     },
     {
-      name: "Circle CI",
+      name: "Azure App Configuration",
+      slug: "azure-app-configuration",
+      image: "Microsoft Azure.png",
+      isAvailable: true,
+      type: "oauth",
+      clientId: appCfg.CLIENT_ID_AZURE,
+      docsLink: ""
+    },
+    {
+      name: "CircleCI",
       slug: "circleci",
-      image: "Circle CI.png",
+      image: "CircleCI.png",
+      isAvailable: true,
+      type: "pat",
+      clientId: "",
+      docsLink: ""
+    },
+    {
+      name: "Databricks",
+      slug: "databricks",
+      image: "Databricks.png",
       isAvailable: true,
       type: "pat",
       clientId: "",
@@ -296,7 +334,7 @@ export const getIntegrationOptions = async () => {
       docsLink: ""
     },
     {
-      name: "BitBucket",
+      name: "Bitbucket",
       slug: "bitbucket",
       image: "BitBucket.png",
       isAvailable: true,
@@ -357,8 +395,40 @@ export const getIntegrationOptions = async () => {
       type: "pat",
       clientId: "",
       docsLink: ""
+    },
+    {
+      name: "Rundeck",
+      slug: "rundeck",
+      image: "Rundeck.svg",
+      isAvailable: true,
+      type: "pat",
+      clientId: "",
+      docsLink: ""
+    },
+    {
+      name: "Azure DevOps",
+      slug: "azure-devops",
+      image: "Microsoft Azure.png",
+      isAvailable: true,
+      type: "pat",
+      clientId: "",
+      docsLink: ""
+    },
+    {
+      name: "Octopus Deploy",
+      slug: "octopus-deploy",
+      image: "Octopus Deploy.png",
+      isAvailable: true,
+      type: "sat",
+      clientId: "",
+      docsLink: ""
     }
   ];
 
   return INTEGRATION_OPTIONS;
 };
+
+export enum IntegrationMetadataSyncMode {
+  CUSTOM = "custom",
+  SECRET_METADATA = "secret-metadata"
+}

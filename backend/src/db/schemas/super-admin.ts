@@ -5,6 +5,8 @@
 
 import { z } from "zod";
 
+import { zodBuffer } from "@app/lib/zod";
+
 import { TImmutableDBKeys } from "./models";
 
 export const SuperAdminSchema = z.object({
@@ -12,9 +14,18 @@ export const SuperAdminSchema = z.object({
   initialized: z.boolean().default(false).nullable().optional(),
   allowSignUp: z.boolean().default(true).nullable().optional(),
   createdAt: z.date(),
-  updatedAt: z.date()
+  updatedAt: z.date(),
+  allowedSignUpDomain: z.string().nullable().optional(),
+  instanceId: z.string().uuid().default("00000000-0000-0000-0000-000000000000"),
+  trustSamlEmails: z.boolean().default(false).nullable().optional(),
+  trustLdapEmails: z.boolean().default(false).nullable().optional(),
+  trustOidcEmails: z.boolean().default(false).nullable().optional(),
+  defaultAuthOrgId: z.string().uuid().nullable().optional(),
+  enabledLoginMethods: z.string().array().nullable().optional(),
+  encryptedSlackClientId: zodBuffer.nullable().optional(),
+  encryptedSlackClientSecret: zodBuffer.nullable().optional()
 });
 
 export type TSuperAdmin = z.infer<typeof SuperAdminSchema>;
-export type TSuperAdminInsert = Omit<TSuperAdmin, TImmutableDBKeys>;
-export type TSuperAdminUpdate = Partial<Omit<TSuperAdmin, TImmutableDBKeys>>;
+export type TSuperAdminInsert = Omit<z.input<typeof SuperAdminSchema>, TImmutableDBKeys>;
+export type TSuperAdminUpdate = Partial<Omit<z.input<typeof SuperAdminSchema>, TImmutableDBKeys>>;

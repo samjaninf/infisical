@@ -9,3 +9,10 @@ export const removeTrailingSlash = (str: string) => {
 
   return str.endsWith("/") ? str.slice(0, -1) : str;
 };
+
+export const prefixWithSlash = (str: string) => {
+  if (str.startsWith("/")) return str;
+  return `/${str}`;
+};
+
+export const startsWithVowel = (str: string) => /^[aeiou]/i.test(str);

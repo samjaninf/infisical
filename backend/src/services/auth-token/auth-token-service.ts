@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
 
 import bcrypt from "bcrypt";
+import { Knex } from "knex";
 
 import { TAuthTokens, TAuthTokenSessions } from "@app/db/schemas";
 import { getConfig } from "@app/lib/config/env";
-import { UnauthorizedError } from "@app/lib/errors";
+import { ForbiddenRequestError, NotFoundError, UnauthorizedError } from "@app/lib/errors";
+import { TOrgMembershipDALFactory } from "@app/services/org-membership/org-membership-dal";
 
 import { AuthModeJwtTokenPayload } from "../auth/auth-type";
 import { TUserDALFactory } from "../user/user-dal";
@@ -13,8 +15,10 @@ import { TCreateTokenForUserDTO, TIssueAuthTokenDTO, TokenType, TValidateTokenFo
 
 type TAuthTokenServiceFactoryDep = {
   tokenDAL: TTokenDALFactory;
-  userDAL: Pick<TUserDALFactory, "findById">;
+  userDAL: Pick<TUserDALFactory, "findById" | "transaction">;
+  orgMembershipDAL: Pick<TOrgMembershipDALFactory, "findOne">;
 };
+
 export type TAuthTokenServiceFactory = ReturnType<typeof tokenServiceFactory>;
 
 export const getTokenConfig = (tokenType: TokenType) => {
@@ -27,10 +31,17 @@ export const getTokenConfig = (tokenType: TokenType) => {
       const expiresAt = new Date(new Date().getTime() + 86400000);
       return { token, expiresAt };
     }
+    case TokenType.TOKEN_EMAIL_VERIFICATION: {
+      // generate random 6-digit code
+      const token = String(crypto.randomInt(10 ** 5, 10 ** 6 - 1));
+      const triesLeft = 3;
+      const expiresAt = new Date(new Date().getTime() + 86400000);
+      return { token, triesLeft, expiresAt };
+    }
     case TokenType.TOKEN_EMAIL_MFA: {
       // generate random 6-digit code
       const token = String(crypto.randomInt(10 ** 5, 10 ** 6 - 1));
-      const triesLeft = 5;
+      const triesLeft = 3;
       const expiresAt = new Date(new Date().getTime() + 300000);
       return { token, triesLeft, expiresAt };
     }
@@ -46,6 +57,11 @@ export const getTokenConfig = (tokenType: TokenType) => {
       const expiresAt = new Date(new Date().getTime() + 86400000);
       return { token, expiresAt };
     }
+    case TokenType.TOKEN_USER_UNLOCK: {
+      const token = crypto.randomBytes(16).toString("hex");
+      const expiresAt = new Date(new Date().getTime() + 259200000);
+      return { token, expiresAt };
+    }
     default: {
       const token = crypto.randomBytes(16).toString("hex");
       const expiresAt = new Date();
@@ -54,7 +70,7 @@ export const getTokenConfig = (tokenType: TokenType) => {
   }
 };
 
-export const tokenServiceFactory = ({ tokenDAL, userDAL }: TAuthTokenServiceFactoryDep) => {
+export const tokenServiceFactory = ({ tokenDAL, userDAL, orgMembershipDAL }: TAuthTokenServiceFactoryDep) => {
   const createTokenForUser = async ({ type, userId, orgId }: TCreateTokenForUserDTO) => {
     const { token, ...tkCfg } = getTokenConfig(type);
     const appCfg = getConfig();
@@ -108,14 +124,13 @@ export const tokenServiceFactory = ({ tokenDAL, userDAL }: TAuthTokenServiceFact
     return deletedToken?.[0];
   };
 
-  const getUserTokenSession = async ({
-    userId,
-    ip,
-    userAgent
-  }: TIssueAuthTokenDTO): Promise<TAuthTokenSessions | undefined> => {
-    let session = await tokenDAL.findOneTokenSession({ userId, ip, userAgent });
+  const getUserTokenSession = async (
+    { userId, ip, userAgent }: TIssueAuthTokenDTO,
+    tx?: Knex
+  ): Promise<TAuthTokenSessions | undefined> => {
+    let session = await tokenDAL.findOneTokenSession({ userId, ip, userAgent }, tx);
     if (!session) {
-      session = await tokenDAL.insertTokenSession(userId, ip, userAgent);
+      session = await tokenDAL.insertTokenSession(userId, ip, userAgent, tx);
     }
     return session;
   };
@@ -135,13 +150,29 @@ export const tokenServiceFactory = ({ tokenDAL, userDAL }: TAuthTokenServiceFact
       id: token.tokenVersionId,
       userId: token.userId
     });
-    if (!session) throw new UnauthorizedError({ name: "Session not found" });
-    if (token.accessVersion !== session.accessVersion) throw new UnauthorizedError({ name: "Stale session" });
+    if (!session) throw new NotFoundError({ name: "Session not found" });
+    if (token.accessVersion !== session.accessVersion) {
+      throw new UnauthorizedError({ name: "StaleSession", message: "User session is stale, please re-authenticate" });
+    }
 
     const user = await userDAL.findById(session.userId);
-    if (!user || !user.isAccepted) throw new UnauthorizedError({ name: "Token user not found" });
+    if (!user || !user.isAccepted) throw new NotFoundError({ message: `User with ID '${session.userId}' not found` });
 
-    return { user, tokenVersionId: token.tokenVersionId };
+    if (token.organizationId) {
+      const orgMembership = await orgMembershipDAL.findOne({
+        userId: user.id,
+        orgId: token.organizationId
+      });
+
+      if (!orgMembership) {
+        throw new ForbiddenRequestError({ message: "User not member of organization" });
+      }
+      if (!orgMembership.isActive) {
+        throw new ForbiddenRequestError({ message: "User organization membership is inactive" });
+      }
+    }
+
+    return { user, tokenVersionId: token.tokenVersionId, orgId: token.organizationId };
   };
 
   return {

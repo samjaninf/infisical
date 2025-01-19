@@ -1,6 +1,6 @@
 import { ProbotOctokit } from "probot";
 
-import { OrgMembershipRole } from "@app/db/schemas";
+import { OrgMembershipRole, TableName } from "@app/db/schemas";
 import { getConfig } from "@app/lib/config/env";
 import { logger } from "@app/lib/logger";
 import { QueueJobs, QueueName, TQueueServiceFactory } from "@app/queue";
@@ -61,10 +61,10 @@ export const secretScanningQueueFactory = ({
   const getOrgAdminEmails = async (organizationId: string) => {
     // get emails of admins
     const adminsOfWork = await orgMemberDAL.findMembership({
-      orgId: organizationId,
+      [`${TableName.Organization}.id` as string]: organizationId,
       role: OrgMembershipRole.Admin
     });
-    return adminsOfWork.map((userObject) => userObject.email);
+    return adminsOfWork.filter((userObject) => userObject.email).map((userObject) => userObject.email as string);
   };
 
   queueService.start(QueueName.SecretPushEventScan, async (job) => {
@@ -149,7 +149,7 @@ export const secretScanningQueueFactory = ({
       await smtpService.sendMail({
         template: SmtpTemplates.SecretLeakIncident,
         subjectLine: `Incident alert: leaked secrets found in Github repository ${repository.fullName}`,
-        recipients: adminEmails,
+        recipients: adminEmails.filter((email) => email).map((email) => email),
         substitutions: {
           numberOfSecrets: Object.keys(allFindingsByFingerprint).length,
           pusher_email: pusher.email,
@@ -158,7 +158,7 @@ export const secretScanningQueueFactory = ({
       });
     }
 
-    telemetryService.sendPostHogEvents({
+    await telemetryService.sendPostHogEvents({
       event: PostHogEventTypes.SecretScannerPush,
       distinctId: repository.fullName,
       properties: {
@@ -221,14 +221,14 @@ export const secretScanningQueueFactory = ({
       await smtpService.sendMail({
         template: SmtpTemplates.SecretLeakIncident,
         subjectLine: `Incident alert: leaked secrets found in Github repository ${repository.fullName}`,
-        recipients: adminEmails,
+        recipients: adminEmails.filter((email) => email).map((email) => email),
         substitutions: {
           numberOfSecrets: findings.length
         }
       });
     }
 
-    telemetryService.sendPostHogEvents({
+    await telemetryService.sendPostHogEvents({
       event: PostHogEventTypes.SecretScannerFull,
       distinctId: repository.fullName,
       properties: {
@@ -238,11 +238,11 @@ export const secretScanningQueueFactory = ({
   });
 
   queueService.listen(QueueName.SecretPushEventScan, "failed", (job, err) => {
-    logger.error("Failed to secret scan on push", job?.data, err);
+    logger.error(err, "Failed to secret scan on push", job?.data);
   });
 
   queueService.listen(QueueName.SecretFullRepoScan, "failed", (job, err) => {
-    logger.error("Failed to do full repo secret scan", job?.data, err);
+    logger.error(err, "Failed to do full repo secret scan", job?.data);
   });
 
   return { startFullRepoScan, startPushEventScan };

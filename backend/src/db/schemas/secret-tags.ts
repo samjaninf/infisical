@@ -9,15 +9,15 @@ import { TImmutableDBKeys } from "./models";
 
 export const SecretTagsSchema = z.object({
   id: z.string().uuid(),
-  name: z.string(),
   slug: z.string(),
   color: z.string().nullable().optional(),
   createdAt: z.date(),
   updatedAt: z.date(),
   createdBy: z.string().uuid().nullable().optional(),
-  projectId: z.string()
+  projectId: z.string(),
+  createdByActorType: z.string().default("user")
 });
 
 export type TSecretTags = z.infer<typeof SecretTagsSchema>;
-export type TSecretTagsInsert = Omit<TSecretTags, TImmutableDBKeys>;
-export type TSecretTagsUpdate = Partial<Omit<TSecretTags, TImmutableDBKeys>>;
+export type TSecretTagsInsert = Omit<z.input<typeof SecretTagsSchema>, TImmutableDBKeys>;
+export type TSecretTagsUpdate = Partial<Omit<z.input<typeof SecretTagsSchema>, TImmutableDBKeys>>;

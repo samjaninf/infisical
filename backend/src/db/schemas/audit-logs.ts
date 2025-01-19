@@ -20,9 +20,10 @@ export const AuditLogsSchema = z.object({
   createdAt: z.date(),
   updatedAt: z.date(),
   orgId: z.string().uuid().nullable().optional(),
-  projectId: z.string().nullable().optional()
+  projectId: z.string().nullable().optional(),
+  projectName: z.string().nullable().optional()
 });
 
 export type TAuditLogs = z.infer<typeof AuditLogsSchema>;
-export type TAuditLogsInsert = Omit<TAuditLogs, TImmutableDBKeys>;
-export type TAuditLogsUpdate = Partial<Omit<TAuditLogs, TImmutableDBKeys>>;
+export type TAuditLogsInsert = Omit<z.input<typeof AuditLogsSchema>, TImmutableDBKeys>;
+export type TAuditLogsUpdate = Partial<Omit<z.input<typeof AuditLogsSchema>, TImmutableDBKeys>>;

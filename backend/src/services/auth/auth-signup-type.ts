@@ -1,5 +1,6 @@
 export type TCompleteAccountSignupDTO = {
   email: string;
+  password: string;
   firstName: string;
   lastName?: string;
   protectedKey: string;
@@ -21,6 +22,7 @@ export type TCompleteAccountSignupDTO = {
 
 export type TCompleteAccountInviteDTO = {
   email: string;
+  password: string;
   firstName: string;
   lastName?: string;
   protectedKey: string;
@@ -34,4 +36,6 @@ export type TCompleteAccountInviteDTO = {
   verifier: string;
   ip: string;
   userAgent: string;
+  authorization: string;
+  tokenMetadata?: string;
 };

@@ -21,9 +21,14 @@ export const UserEncryptionKeysSchema = z.object({
   tag: z.string(),
   salt: z.string(),
   verifier: z.string(),
-  userId: z.string().uuid()
+  userId: z.string().uuid(),
+  hashedPassword: z.string().nullable().optional(),
+  serverEncryptedPrivateKey: z.string().nullable().optional(),
+  serverEncryptedPrivateKeyIV: z.string().nullable().optional(),
+  serverEncryptedPrivateKeyTag: z.string().nullable().optional(),
+  serverEncryptedPrivateKeyEncoding: z.string().nullable().optional()
 });
 
 export type TUserEncryptionKeys = z.infer<typeof UserEncryptionKeysSchema>;
-export type TUserEncryptionKeysInsert = Omit<TUserEncryptionKeys, TImmutableDBKeys>;
-export type TUserEncryptionKeysUpdate = Partial<Omit<TUserEncryptionKeys, TImmutableDBKeys>>;
+export type TUserEncryptionKeysInsert = Omit<z.input<typeof UserEncryptionKeysSchema>, TImmutableDBKeys>;
+export type TUserEncryptionKeysUpdate = Partial<Omit<z.input<typeof UserEncryptionKeysSchema>, TImmutableDBKeys>>;

@@ -20,14 +20,14 @@ export const secretImportDALFactory = (db: TDbClient) => {
     return lastPos?.position || 0;
   };
 
-  const updateAllPosition = async (folderId: string, pos: number, targetPos: number, tx?: Knex) => {
+  const updateAllPosition = async (folderId: string, pos: number, targetPos: number, positionInc = 1, tx?: Knex) => {
     try {
       if (targetPos === -1) {
         // this means delete
         await (tx || db)(TableName.SecretImport)
           .where({ folderId })
           .andWhere("position", ">", pos)
-          .decrement("position", 1);
+          .decrement("position", positionInc);
         return;
       }
 
@@ -36,23 +36,122 @@ export const secretImportDALFactory = (db: TDbClient) => {
           .where({ folderId })
           .where("position", "<=", targetPos)
           .andWhere("position", ">", pos)
-          .decrement("position", 1);
+          .decrement("position", positionInc);
       } else {
         await (tx || db)(TableName.SecretImport)
           .where({ folderId })
           .where("position", ">=", targetPos)
           .andWhere("position", "<", pos)
-          .increment("position", 1);
+          .increment("position", positionInc);
       }
     } catch (error) {
       throw new DatabaseError({ error, name: "Update position" });
     }
   };
 
-  const find = async (filter: Partial<TSecretImports>, tx?: Knex) => {
+  const find = async (
+    {
+      search,
+      limit,
+      offset,
+      ...filter
+    }: Partial<
+      TSecretImports & {
+        projectId: string;
+        search?: string;
+        limit?: number;
+        offset?: number;
+      }
+    >,
+    tx?: Knex
+  ) => {
     try {
-      const docs = await (tx || db)(TableName.SecretImport)
+      const query = (tx || db.replicaNode())(TableName.SecretImport)
         .where(filter)
+        .where((bd) => {
+          if (search) {
+            void bd.whereILike("importPath", `%${search}%`);
+          }
+        })
+        .join(TableName.Environment, `${TableName.SecretImport}.importEnv`, `${TableName.Environment}.id`)
+        .select(
+          db.ref("*").withSchema(TableName.SecretImport) as unknown as keyof TSecretImports,
+          db.ref("slug").withSchema(TableName.Environment),
+          db.ref("name").withSchema(TableName.Environment),
+          db.ref("id").withSchema(TableName.Environment).as("envId")
+        )
+        .orderBy("position", "asc");
+
+      if (limit) {
+        void query.limit(limit).offset(offset ?? 0);
+      }
+
+      const docs = await query;
+
+      return docs.map(({ envId, slug, name, ...el }) => ({
+        ...el,
+        importEnv: { id: envId, slug, name }
+      }));
+    } catch (error) {
+      throw new DatabaseError({ error, name: "Find secret imports" });
+    }
+  };
+
+  const findById = async (id: string, tx?: Knex) => {
+    try {
+      const doc = await (tx || db.replicaNode())(TableName.SecretImport)
+        .where({ [`${TableName.SecretImport}.id` as "id"]: id })
+        .join(TableName.Environment, `${TableName.SecretImport}.importEnv`, `${TableName.Environment}.id`)
+        .select(
+          db.ref("*").withSchema(TableName.SecretImport) as unknown as keyof TSecretImports,
+          db.ref("slug").withSchema(TableName.Environment),
+          db.ref("name").withSchema(TableName.Environment),
+          db.ref("id").withSchema(TableName.Environment).as("envId")
+        )
+        .first();
+
+      if (!doc) {
+        return null;
+      }
+
+      const { envId, slug, name, ...el } = doc;
+
+      return {
+        ...el,
+        importEnv: { id: envId, slug, name }
+      };
+    } catch (error) {
+      throw new DatabaseError({ error, name: "Find secret imports" });
+    }
+  };
+
+  const getProjectImportCount = async (
+    { search, ...filter }: Partial<TSecretImports & { projectId: string; search?: string }>,
+    tx?: Knex
+  ) => {
+    try {
+      const docs = await (tx || db.replicaNode())(TableName.SecretImport)
+        .where(filter)
+        .where("isReplication", false)
+        .where((bd) => {
+          if (search) {
+            void bd.whereILike("importPath", `%${search}%`);
+          }
+        })
+        .join(TableName.Environment, `${TableName.SecretImport}.importEnv`, `${TableName.Environment}.id`)
+        .count();
+
+      return Number(docs[0]?.count ?? 0);
+    } catch (error) {
+      throw new DatabaseError({ error, name: "get secret imports count" });
+    }
+  };
+
+  const findByFolderIds = async (folderIds: string[], tx?: Knex) => {
+    try {
+      const docs = await (tx || db.replicaNode())(TableName.SecretImport)
+        .whereIn("folderId", folderIds)
+        .where("isReplication", false)
         .join(TableName.Environment, `${TableName.SecretImport}.importEnv`, `${TableName.Environment}.id`)
         .select(
           db.ref("*").withSchema(TableName.SecretImport) as unknown as keyof TSecretImports,
@@ -73,7 +172,10 @@ export const secretImportDALFactory = (db: TDbClient) => {
   return {
     ...secretImportOrm,
     find,
+    findById,
+    findByFolderIds,
     findLastImportPosition,
-    updateAllPosition
+    updateAllPosition,
+    getProjectImportCount
   };
 };

@@ -32,18 +32,27 @@ export const getUserAgentType = (userAgent: string | undefined) => {
 export const injectAuditLogInfo = fp(async (server: FastifyZodProvider) => {
   server.decorateRequest("auditLogInfo", null);
   server.addHook("onRequest", async (req) => {
-    if (!req.auth) return;
     const userAgent = req.headers["user-agent"] ?? "";
     const payload = {
       ipAddress: req.realIp,
       userAgent,
       userAgentType: getUserAgentType(userAgent)
     } as typeof req.auditLogInfo;
+
+    if (!req.auth) {
+      payload.actor = {
+        type: ActorType.UNKNOWN_USER,
+        metadata: {}
+      };
+      req.auditLogInfo = payload;
+      return;
+    }
     if (req.auth.actor === ActorType.USER) {
       payload.actor = {
         type: ActorType.USER,
         metadata: {
           email: req.auth.user.email,
+          username: req.auth.user.username,
           userId: req.permission.id
         }
       };
@@ -63,8 +72,13 @@ export const injectAuditLogInfo = fp(async (server: FastifyZodProvider) => {
           identityId: req.auth.identityId
         }
       };
+    } else if (req.auth.actor === ActorType.SCIM_CLIENT) {
+      payload.actor = {
+        type: ActorType.SCIM_CLIENT,
+        metadata: {}
+      };
     } else {
-      throw new BadRequestError({ message: "Missing logic for other actor" });
+      throw new BadRequestError({ message: "Invalid actor type provided" });
     }
     req.auditLogInfo = payload;
   });

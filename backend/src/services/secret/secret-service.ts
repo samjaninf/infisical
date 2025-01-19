@@ -1,44 +1,83 @@
+/* eslint-disable no-unreachable-loop */
+/* eslint-disable no-await-in-loop */
 import { ForbiddenError, subject } from "@casl/ability";
 
-import { SecretEncryptionAlgo, SecretKeyEncoding, SecretsSchema, SecretType, TableName } from "@app/db/schemas";
+import {
+  ActionProjectType,
+  ProjectMembershipRole,
+  ProjectUpgradeStatus,
+  SecretEncryptionAlgo,
+  SecretKeyEncoding,
+  SecretsSchema,
+  SecretType
+} from "@app/db/schemas";
+import { TLicenseServiceFactory } from "@app/ee/services/license/license-service";
 import { TPermissionServiceFactory } from "@app/ee/services/permission/permission-service";
 import { ProjectPermissionActions, ProjectPermissionSub } from "@app/ee/services/permission/project-permission";
+import { TSecretApprovalPolicyServiceFactory } from "@app/ee/services/secret-approval-policy/secret-approval-policy-service";
+import { TSecretApprovalRequestDALFactory } from "@app/ee/services/secret-approval-request/secret-approval-request-dal";
+import { TSecretApprovalRequestSecretDALFactory } from "@app/ee/services/secret-approval-request/secret-approval-request-secret-dal";
+import { TSecretApprovalRequestServiceFactory } from "@app/ee/services/secret-approval-request/secret-approval-request-service";
 import { TSecretSnapshotServiceFactory } from "@app/ee/services/secret-snapshot/secret-snapshot-service";
 import { getConfig } from "@app/lib/config/env";
-import { buildSecretBlindIndexFromName, encryptSymmetric128BitHexKeyUTF8 } from "@app/lib/crypto";
-import { BadRequestError } from "@app/lib/errors";
+import {
+  buildSecretBlindIndexFromName,
+  decryptSymmetric128BitHexKeyUTF8,
+  encryptSymmetric128BitHexKeyUTF8
+} from "@app/lib/crypto";
+import { BadRequestError, ForbiddenRequestError, NotFoundError } from "@app/lib/errors";
 import { groupBy, pick } from "@app/lib/fn";
 import { logger } from "@app/lib/logger";
+import { alphaNumericNanoId } from "@app/lib/nanoid";
+import { OrgServiceActor } from "@app/lib/types";
+import { TGetSecretsRawByFolderMappingsDTO } from "@app/services/secret-v2-bridge/secret-v2-bridge-types";
 
 import { ActorType } from "../auth/auth-type";
+import { TProjectDALFactory } from "../project/project-dal";
 import { TProjectBotServiceFactory } from "../project-bot/project-bot-service";
+import { TProjectEnvDALFactory } from "../project-env/project-env-dal";
 import { TSecretBlindIndexDALFactory } from "../secret-blind-index/secret-blind-index-dal";
 import { TSecretFolderDALFactory } from "../secret-folder/secret-folder-dal";
 import { TSecretImportDALFactory } from "../secret-import/secret-import-dal";
 import { fnSecretsFromImports } from "../secret-import/secret-import-fns";
 import { TSecretTagDALFactory } from "../secret-tag/secret-tag-dal";
+import { TSecretV2BridgeServiceFactory } from "../secret-v2-bridge/secret-v2-bridge-service";
+import { TGetSecretReferencesTreeDTO } from "../secret-v2-bridge/secret-v2-bridge-types";
 import { TSecretDALFactory } from "./secret-dal";
-import { decryptSecretRaw, generateSecretBlindIndexBySalt } from "./secret-fns";
+import {
+  decryptSecretRaw,
+  fnSecretBlindIndexCheck,
+  fnSecretBulkDelete,
+  fnSecretBulkInsert,
+  fnSecretBulkUpdate,
+  getAllNestedSecretReferences,
+  interpolateSecrets,
+  recursivelyGetSecretPaths
+} from "./secret-fns";
 import { TSecretQueueFactory } from "./secret-queue";
 import {
+  SecretOperations,
+  SecretProtectionType,
+  TAttachSecretTagsDTO,
+  TBackFillSecretReferencesDTO,
   TCreateBulkSecretDTO,
+  TCreateManySecretRawDTO,
   TCreateSecretDTO,
   TCreateSecretRawDTO,
   TDeleteBulkSecretDTO,
+  TDeleteManySecretRawDTO,
   TDeleteSecretDTO,
   TDeleteSecretRawDTO,
-  TFnSecretBlindIndexCheck,
-  TFnSecretBlindIndexCheckV2,
-  TFnSecretBulkDelete,
-  TFnSecretBulkInsert,
-  TFnSecretBulkUpdate,
   TGetASecretDTO,
   TGetASecretRawDTO,
+  TGetSecretAccessListDTO,
   TGetSecretsDTO,
   TGetSecretsRawDTO,
   TGetSecretVersionsDTO,
-  TListSecretVersionDTO,
+  TMoveSecretsDTO,
+  TStartSecretsV2MigrationDTO,
   TUpdateBulkSecretDTO,
+  TUpdateManySecretRawDTO,
   TUpdateSecretDTO,
   TUpdateSecretRawDTO
 } from "./secret-types";
@@ -49,19 +88,40 @@ type TSecretServiceFactoryDep = {
   secretDAL: TSecretDALFactory;
   secretTagDAL: TSecretTagDALFactory;
   secretVersionDAL: TSecretVersionDALFactory;
-  folderDAL: Pick<TSecretFolderDALFactory, "findBySecretPath" | "updateById" | "findById" | "findByManySecretPath">;
+  projectDAL: Pick<TProjectDALFactory, "checkProjectUpgradeStatus" | "findProjectBySlug">;
+  projectEnvDAL: Pick<TProjectEnvDALFactory, "findOne">;
+  folderDAL: Pick<
+    TSecretFolderDALFactory,
+    "findBySecretPath" | "updateById" | "findById" | "findByManySecretPath" | "find"
+  >;
+  secretV2BridgeService: TSecretV2BridgeServiceFactory;
   secretBlindIndexDAL: TSecretBlindIndexDALFactory;
-  permissionService: Pick<TPermissionServiceFactory, "getProjectPermission">;
+  permissionService: Pick<TPermissionServiceFactory, "getProjectPermission" | "getProjectPermissions">;
   snapshotService: Pick<TSecretSnapshotServiceFactory, "performSnapshot">;
-  secretQueueService: Pick<TSecretQueueFactory, "syncSecrets" | "handleSecretReminder" | "removeSecretReminder">;
+  secretQueueService: Pick<
+    TSecretQueueFactory,
+    "syncSecrets" | "handleSecretReminder" | "removeSecretReminder" | "startSecretV2Migration"
+  >;
   projectBotService: Pick<TProjectBotServiceFactory, "getBotKey">;
-  secretImportDAL: Pick<TSecretImportDALFactory, "find">;
+  secretImportDAL: Pick<TSecretImportDALFactory, "find" | "findByFolderIds">;
   secretVersionTagDAL: Pick<TSecretVersionTagDALFactory, "insertMany">;
+  secretApprovalPolicyService: Pick<TSecretApprovalPolicyServiceFactory, "getSecretApprovalPolicy">;
+  secretApprovalRequestService: Pick<
+    TSecretApprovalRequestServiceFactory,
+    "generateSecretApprovalRequest" | "generateSecretApprovalRequestV2Bridge"
+  >;
+  secretApprovalRequestDAL: Pick<TSecretApprovalRequestDALFactory, "create" | "transaction">;
+  secretApprovalRequestSecretDAL: Pick<
+    TSecretApprovalRequestSecretDALFactory,
+    "insertMany" | "insertApprovalSecretTags"
+  >;
+  licenseService: Pick<TLicenseServiceFactory, "getPlan">;
 };
 
 export type TSecretServiceFactory = ReturnType<typeof secretServiceFactory>;
 export const secretServiceFactory = ({
   secretDAL,
+  projectEnvDAL,
   secretTagDAL,
   secretVersionDAL,
   folderDAL,
@@ -69,16 +129,44 @@ export const secretServiceFactory = ({
   permissionService,
   snapshotService,
   secretQueueService,
+  projectDAL,
   projectBotService,
   secretImportDAL,
-  secretVersionTagDAL
+  secretVersionTagDAL,
+  secretApprovalPolicyService,
+  secretApprovalRequestDAL,
+  secretApprovalRequestSecretDAL,
+  secretV2BridgeService,
+  secretApprovalRequestService,
+  licenseService
 }: TSecretServiceFactoryDep) => {
+  const getSecretReference = async (projectId: string) => {
+    // if bot key missing means e2e still exist
+    const projectBot = await projectBotService.getBotKey(projectId).catch(() => null);
+    return (el: { ciphertext?: string; iv: string; tag: string }) =>
+      projectBot?.botKey
+        ? getAllNestedSecretReferences(
+            decryptSymmetric128BitHexKeyUTF8({
+              ciphertext: el.ciphertext || "",
+              iv: el.iv,
+              tag: el.tag,
+              key: projectBot.botKey
+            })
+          )
+        : undefined;
+  };
+
   // utility function to get secret blind index data
   const interalGenSecBlindIndexByName = async (projectId: string, secretName: string) => {
     const appCfg = getConfig();
 
     const secretBlindIndexDoc = await secretBlindIndexDAL.findOne({ projectId });
-    if (!secretBlindIndexDoc) throw new BadRequestError({ message: "Blind index not found", name: "Create secret" });
+    if (!secretBlindIndexDoc) {
+      throw new NotFoundError({
+        message: `Blind index for project with ID '${projectId}' not found`,
+        name: "CreateSecret"
+      });
+    }
 
     const secretBlindIndex = await buildSecretBlindIndexFromName({
       secretName,
@@ -89,197 +177,51 @@ export const secretServiceFactory = ({
       ciphertext: secretBlindIndexDoc.encryptedSaltCipherText,
       iv: secretBlindIndexDoc.saltIV
     });
-    if (!secretBlindIndex) throw new BadRequestError({ message: "Secret not found" });
+    if (!secretBlindIndex) throw new NotFoundError({ message: `Secret with name '${secretName}' not found` });
     return secretBlindIndex;
   };
 
-  // these functions are special functions shared by a couple of resources
-  // used by secret approval, rotation or anywhere in which secret needs to modified
-  const fnSecretBulkInsert = async ({ folderId, inputSecrets, tx }: TFnSecretBulkInsert) => {
-    const newSecrets = await secretDAL.insertMany(
-      inputSecrets.map(({ tags, ...el }) => ({ ...el, folderId })),
-      tx
-    );
-    const newSecretGroupByBlindIndex = groupBy(newSecrets, (item) => item.secretBlindIndex as string);
-    const newSecretTags = inputSecrets.flatMap(({ tags: secretTags = [], secretBlindIndex }) =>
-      secretTags.map((tag) => ({
-        [`${TableName.SecretTag}Id` as const]: tag,
-        [`${TableName.Secret}Id` as const]: newSecretGroupByBlindIndex[secretBlindIndex as string][0].id
-      }))
-    );
-    const secretVersions = await secretVersionDAL.insertMany(
-      inputSecrets.map(({ tags, ...el }) => ({
-        ...el,
-        folderId,
-        secretId: newSecretGroupByBlindIndex[el.secretBlindIndex as string][0].id
-      })),
-      tx
-    );
-    if (newSecretTags.length) {
-      const secTags = await secretTagDAL.saveTagsToSecret(newSecretTags, tx);
-      const secVersionsGroupBySecId = groupBy(secretVersions, (i) => i.secretId);
-      const newSecretVersionTags = secTags.flatMap(({ secretsId, secret_tagsId }) => ({
-        [`${TableName.SecretVersion}Id` as const]: secVersionsGroupBySecId[secretsId][0].id,
-        [`${TableName.SecretTag}Id` as const]: secret_tagsId
-      }));
-      await secretVersionTagDAL.insertMany(newSecretVersionTags, tx);
-    }
-
-    return newSecrets.map((secret) => ({ ...secret, _id: secret.id }));
-  };
-
-  const fnSecretBulkUpdate = async ({ tx, inputSecrets, folderId, projectId }: TFnSecretBulkUpdate) => {
-    const newSecrets = await secretDAL.bulkUpdate(
-      inputSecrets.map(({ filter, data: { tags, ...data } }) => ({
-        filter: { ...filter, folderId },
-        data
-      })),
-      tx
-    );
-    const secretVersions = await secretVersionDAL.insertMany(
-      newSecrets.map(({ id, createdAt, updatedAt, ...el }) => ({
-        ...el,
-        secretId: id
-      })),
-      tx
-    );
-    const secsUpdatedTag = inputSecrets.flatMap(({ data: { tags } }, i) =>
-      tags !== undefined ? { tags, secretId: newSecrets[i].id } : []
-    );
-    if (secsUpdatedTag.length) {
-      await secretTagDAL.deleteTagsManySecret(
-        projectId,
-        secsUpdatedTag.map(({ secretId }) => secretId),
-        tx
-      );
-      const newSecretTags = secsUpdatedTag.flatMap(({ tags: secretTags = [], secretId }) =>
-        secretTags.map((tag) => ({
-          [`${TableName.SecretTag}Id` as const]: tag,
-          [`${TableName.Secret}Id` as const]: secretId
-        }))
-      );
-      if (newSecretTags.length) {
-        const secTags = await secretTagDAL.saveTagsToSecret(newSecretTags, tx);
-        const secVersionsGroupBySecId = groupBy(secretVersions, (i) => i.secretId);
-        const newSecretVersionTags = secTags.flatMap(({ secretsId, secret_tagsId }) => ({
-          [`${TableName.SecretVersion}Id` as const]: secVersionsGroupBySecId[secretsId][0].id,
-          [`${TableName.SecretTag}Id` as const]: secret_tagsId
-        }));
-        await secretVersionTagDAL.insertMany(newSecretVersionTags, tx);
-      }
-    }
-
-    return newSecrets.map((secret) => ({ ...secret, _id: secret.id }));
-  };
-
-  const fnSecretBulkDelete = async ({ folderId, inputSecrets, tx, actorId }: TFnSecretBulkDelete) => {
-    const deletedSecrets = await secretDAL.deleteMany(
-      inputSecrets.map(({ type, secretBlindIndex }) => ({
-        blindIndex: secretBlindIndex,
-        type
-      })),
-      folderId,
+  const createSecret = async ({
+    path,
+    actor,
+    actorId,
+    actorOrgId,
+    environment,
+    actorAuthMethod,
+    projectId,
+    ...inputSecret
+  }: TCreateSecretDTO) => {
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
       actorId,
-      tx
-    );
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
 
-    for (const s of deletedSecrets) {
-      if (s.secretReminderRepeatDays) {
-        // eslint-disable-next-line no-await-in-loop
-        await secretQueueService
-          .removeSecretReminder({
-            secretId: s.id,
-            repeatDays: s.secretReminderRepeatDays
-          })
-          .catch((err) => {
-            logger.error(err, `Failed to delete secret reminder for secret with ID ${s?.id}`);
-          });
-      }
-    }
-
-    return deletedSecrets;
-  };
-
-  // this is a utility function for secret modification
-  // this will check given secret name blind index exist or not
-  // if its a created secret set isNew to true
-  // thus if these blindindex exist it will throw an error
-  // vice versa when u need to check for updated secret
-  // this will also return the blind index grouped by secretName
-  const fnSecretBlindIndexCheck = async ({
-    inputSecrets,
-    folderId,
-    isNew,
-    userId,
-    blindIndexCfg
-  }: TFnSecretBlindIndexCheck) => {
-    const blindIndex2KeyName: Record<string, string> = {}; // used at audit log point
-    const keyName2BlindIndex = await Promise.all(
-      inputSecrets.map(({ secretName }) => generateSecretBlindIndexBySalt(secretName, blindIndexCfg))
-    ).then((blindIndexes) =>
-      blindIndexes.reduce<Record<string, string>>((prev, curr, i) => {
-        // eslint-disable-next-line
-        prev[inputSecrets[i].secretName] = curr;
-        blindIndex2KeyName[curr] = inputSecrets[i].secretName;
-        return prev;
-      }, {})
-    );
-
-    if (inputSecrets.some(({ type }) => type === SecretType.Personal) && !userId) {
-      throw new BadRequestError({ message: "Missing user id for personal secret" });
-    }
-
-    const secrets = await secretDAL.findByBlindIndexes(
-      folderId,
-      inputSecrets.map(({ secretName, type }) => ({
-        blindIndex: keyName2BlindIndex[secretName],
-        type: type || SecretType.Shared
-      })),
-      userId
-    );
-
-    if (isNew) {
-      if (secrets.length) throw new BadRequestError({ message: "Secret already exist" });
-    } else if (secrets.length !== inputSecrets.length)
-      throw new BadRequestError({
-        message: `Secret not found: blind index ${JSON.stringify(keyName2BlindIndex)}`
-      });
-
-    return { blindIndex2KeyName, keyName2BlindIndex, secrets };
-  };
-
-  // this is used when secret blind index already exist
-  // mainly for secret approval
-  const fnSecretBlindIndexCheckV2 = async ({ inputSecrets, folderId, userId }: TFnSecretBlindIndexCheckV2) => {
-    if (inputSecrets.some(({ type }) => type === SecretType.Personal) && !userId) {
-      throw new BadRequestError({ message: "Missing user id for personal secret" });
-    }
-    const secrets = await secretDAL.findByBlindIndexes(
-      folderId,
-      inputSecrets.map(({ secretBlindIndex, type }) => ({
-        blindIndex: secretBlindIndex,
-        type: type || SecretType.Shared
-      })),
-      userId
-    );
-    const secsGroupedByBlindIndex = groupBy(secrets, (i) => i.secretBlindIndex as string);
-
-    return { secsGroupedByBlindIndex, secrets };
-  };
-
-  const createSecret = async ({ path, actor, actorId, environment, projectId, ...inputSecret }: TCreateSecretDTO) => {
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, projectId);
     ForbiddenError.from(permission).throwUnlessCan(
       ProjectPermissionActions.Create,
       subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
     );
 
+    await projectDAL.checkProjectUpgradeStatus(projectId);
+
     const folder = await folderDAL.findBySecretPath(projectId, environment, path);
-    if (!folder) throw new BadRequestError({ message: "Folder not  found", name: "Create secret" });
+    if (!folder)
+      throw new NotFoundError({
+        message: `Folder with path '${path}' in environment with slug '${environment}' not found`,
+        name: "CreateSecret"
+      });
     const folderId = folder.id;
 
     const blindIndexCfg = await secretBlindIndexDAL.findOne({ projectId });
-    if (!blindIndexCfg) throw new BadRequestError({ message: "Blind index not found", name: "CreateSecret" });
+    if (!blindIndexCfg) {
+      throw new NotFoundError({
+        message: `Blind index for project with ID '${projectId}' not found`,
+        name: "CreateSecret"
+      });
+    }
 
     if (ActorType.USER !== actor && inputSecret.type === SecretType.Personal) {
       throw new BadRequestError({ message: "Must be user to create personal secret" });
@@ -290,7 +232,8 @@ export const secretServiceFactory = ({
       folderId,
       isNew: true,
       userId: actorId,
-      blindIndexCfg
+      blindIndexCfg,
+      secretDAL
     });
 
     // if user creating personal check its shared also exist
@@ -309,9 +252,11 @@ export const secretServiceFactory = ({
     // validate tags
     // fetch all tags and if not same count throw error meaning one was invalid tags
     const tags = inputSecret.tags ? await secretTagDAL.findManyTagsById(projectId, inputSecret.tags) : [];
-    if ((inputSecret.tags || []).length !== tags.length) throw new BadRequestError({ message: "Tag not found" });
+    if ((inputSecret.tags || []).length !== tags.length)
+      throw new NotFoundError({ message: "One or more tags not found" });
 
     const { secretName, type, ...el } = inputSecret;
+    const references = await getSecretReference(projectId);
     const secret = await secretDAL.transaction((tx) =>
       fnSecretBulkInsert({
         folderId,
@@ -324,32 +269,80 @@ export const secretServiceFactory = ({
             userId: inputSecret.type === SecretType.Personal ? actorId : null,
             algorithm: SecretEncryptionAlgo.AES_256_GCM,
             keyEncoding: SecretKeyEncoding.UTF8,
-            tags: inputSecret.tags
+            tags: inputSecret.tags,
+            references: references({
+              ciphertext: inputSecret.secretValueCiphertext,
+              iv: inputSecret.secretValueIV,
+              tag: inputSecret.secretValueTag
+            })
           }
         ],
+        secretDAL,
+        secretVersionDAL,
+        secretTagDAL,
+        secretVersionTagDAL,
         tx
       })
     );
 
-    await snapshotService.performSnapshot(folderId);
-    await secretQueueService.syncSecrets({ secretPath: path, projectId, environment });
-    // TODO(akhilmhdh-pg): licence check, posthog service and snapshot
-    return { ...secret[0], environment, workspace: projectId, tags };
+    if (inputSecret.type === SecretType.Shared) {
+      await snapshotService.performSnapshot(folderId);
+      await secretQueueService.syncSecrets({
+        secretPath: path,
+        actorId,
+        actor,
+        projectId,
+        orgId: actorOrgId,
+        environmentSlug: folder.environment.slug
+      });
+    }
+    return { ...secret[0], environment, workspace: projectId, tags, secretPath: path };
   };
 
-  const updateSecret = async ({ path, actor, actorId, environment, projectId, ...inputSecret }: TUpdateSecretDTO) => {
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, projectId);
+  const updateSecret = async ({
+    path,
+    actor,
+    actorId,
+    actorOrgId,
+    environment,
+    actorAuthMethod,
+    projectId,
+    ...inputSecret
+  }: TUpdateSecretDTO) => {
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
     ForbiddenError.from(permission).throwUnlessCan(
       ProjectPermissionActions.Edit,
       subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
     );
 
+    await projectDAL.checkProjectUpgradeStatus(projectId);
+
+    if (inputSecret.newSecretName === "") {
+      throw new BadRequestError({ message: "New secret name cannot be empty" });
+    }
+
     const folder = await folderDAL.findBySecretPath(projectId, environment, path);
-    if (!folder) throw new BadRequestError({ message: "Folder not  found", name: "Create secret" });
+    if (!folder)
+      throw new NotFoundError({
+        message: `Folder with path '${path}' in environment with slug '${environment}' not found`,
+        name: "CreateSecret"
+      });
     const folderId = folder.id;
 
     const blindIndexCfg = await secretBlindIndexDAL.findOne({ projectId });
-    if (!blindIndexCfg) throw new BadRequestError({ message: "Blind index not found", name: "CreateSecret" });
+    if (!blindIndexCfg)
+      throw new NotFoundError({
+        message: `Blind index for project with ID '${projectId}' not found`,
+        name: "CreateSecret"
+      });
 
     if (ActorType.USER !== actor && inputSecret.type === SecretType.Personal) {
       throw new BadRequestError({ message: "Must be user to create personal secret" });
@@ -360,7 +353,8 @@ export const secretServiceFactory = ({
       folderId,
       isNew: false,
       blindIndexCfg,
-      userId: actorId
+      userId: actorId,
+      secretDAL
     });
     if (inputSecret.newSecretName && inputSecret.type === SecretType.Personal) {
       throw new BadRequestError({ message: "Personal secret cannot change the key name" });
@@ -372,7 +366,8 @@ export const secretServiceFactory = ({
         inputSecrets: [{ secretName: inputSecret.newSecretName }],
         folderId,
         isNew: true,
-        blindIndexCfg
+        blindIndexCfg,
+        secretDAL
       });
       newSecretNameBlindIndex = kN2NewBlindIndex[inputSecret.newSecretName];
     }
@@ -387,9 +382,12 @@ export const secretServiceFactory = ({
     });
 
     const tags = inputSecret.tags ? await secretTagDAL.findManyTagsById(projectId, inputSecret.tags) : [];
-    if ((inputSecret.tags || []).length !== tags.length) throw new BadRequestError({ message: "Tag not found" });
+    if ((inputSecret.tags || []).length !== tags.length)
+      throw new NotFoundError({ message: "One or more tags not found" });
 
     const { secretName, ...el } = inputSecret;
+
+    const references = await getSecretReference(projectId);
     const updatedSecret = await secretDAL.transaction(async (tx) =>
       fnSecretBulkUpdate({
         folderId,
@@ -415,33 +413,77 @@ export const secretServiceFactory = ({
                 "secretReminderRepeatDays",
                 "tags"
               ]),
-              secretBlindIndex: newSecretNameBlindIndex || keyName2BlindIndex[secretName]
+              secretBlindIndex: newSecretNameBlindIndex || keyName2BlindIndex[secretName],
+              references: references({
+                ciphertext: inputSecret.secretValueCiphertext,
+                iv: inputSecret.secretValueIV,
+                tag: inputSecret.secretValueTag
+              })
             }
           }
         ],
+        secretDAL,
+        secretVersionDAL,
+        secretTagDAL,
+        secretVersionTagDAL,
         tx
       })
     );
 
-    await snapshotService.performSnapshot(folderId);
-    await secretQueueService.syncSecrets({ secretPath: path, projectId, environment });
-    // TODO(akhilmhdh-pg): licence check, posthog service and snapshot
-    return { ...updatedSecret[0], workspace: projectId, environment };
+    if (inputSecret.type === SecretType.Shared) {
+      await snapshotService.performSnapshot(folderId);
+      await secretQueueService.syncSecrets({
+        secretPath: path,
+        orgId: actorOrgId,
+        actorId,
+        actor,
+        projectId,
+        environmentSlug: folder.environment.slug
+      });
+    }
+    return { ...updatedSecret[0], workspace: projectId, environment, secretPath: path };
   };
 
-  const deleteSecret = async ({ path, actor, actorId, environment, projectId, ...inputSecret }: TDeleteSecretDTO) => {
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, projectId);
+  const deleteSecret = async ({
+    path,
+    actor,
+    actorId,
+    actorOrgId,
+    actorAuthMethod,
+    environment,
+    projectId,
+    ...inputSecret
+  }: TDeleteSecretDTO) => {
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
     ForbiddenError.from(permission).throwUnlessCan(
       ProjectPermissionActions.Delete,
       subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
     );
 
+    await projectDAL.checkProjectUpgradeStatus(projectId);
+
     const folder = await folderDAL.findBySecretPath(projectId, environment, path);
-    if (!folder) throw new BadRequestError({ message: "Folder not  found", name: "Create secret" });
+    if (!folder)
+      throw new NotFoundError({
+        message: `Folder with path '${path}' in environment with slug '${environment}' not found`,
+        name: "DeleteSecret"
+      });
     const folderId = folder.id;
 
     const blindIndexCfg = await secretBlindIndexDAL.findOne({ projectId });
-    if (!blindIndexCfg) throw new BadRequestError({ message: "Blind index not found", name: "CreateSecret" });
+    if (!blindIndexCfg)
+      throw new NotFoundError({
+        message: `Blind index for project with ID '${projectId}' not found`,
+        name: "DeleteSecret"
+      });
 
     if (ActorType.USER !== actor && inputSecret.type === SecretType.Personal) {
       throw new BadRequestError({ message: "Must be user to create personal secret" });
@@ -451,14 +493,17 @@ export const secretServiceFactory = ({
       inputSecrets: [{ secretName: inputSecret.secretName }],
       folderId,
       isNew: false,
-      blindIndexCfg
+      blindIndexCfg,
+      secretDAL
     });
 
-    const deletedSecret = await secretDAL.transaction(async (tx) =>
-      fnSecretBulkDelete({
+    const deletedSecret = await secretDAL.transaction(async (tx) => {
+      const secrets = await fnSecretBulkDelete({
         projectId,
         folderId,
         actorId,
+        secretDAL,
+        secretQueueService,
         inputSecrets: [
           {
             type: inputSecret.type as SecretType,
@@ -466,31 +511,102 @@ export const secretServiceFactory = ({
           }
         ],
         tx
-      })
-    );
+      });
 
-    await snapshotService.performSnapshot(folderId);
-    await secretQueueService.syncSecrets({ secretPath: path, projectId, environment });
+      for await (const secret of secrets) {
+        if (secret.secretReminderRepeatDays !== null && secret.secretReminderRepeatDays !== undefined) {
+          await secretQueueService.removeSecretReminder({
+            repeatDays: secret.secretReminderRepeatDays,
+            secretId: secret.id
+          });
+        }
+      }
 
-    // TODO(akhilmhdh-pg): licence check, posthog service and snapshot
-    return { ...deletedSecret[0], _id: deletedSecret[0].id, workspace: projectId, environment };
+      return secrets;
+    });
+
+    if (inputSecret.type === SecretType.Shared) {
+      await snapshotService.performSnapshot(folderId);
+      await secretQueueService.syncSecrets({
+        secretPath: path,
+        actorId,
+        actor,
+        projectId,
+        orgId: actorOrgId,
+        environmentSlug: folder.environment.slug
+      });
+    }
+
+    return { ...deletedSecret[0], _id: deletedSecret[0].id, workspace: projectId, environment, secretPath: path };
   };
 
-  const getSecrets = async ({ actorId, path, environment, projectId, actor, includeImports }: TGetSecretsDTO) => {
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, projectId);
-    ForbiddenError.from(permission).throwUnlessCan(
-      ProjectPermissionActions.Read,
-      subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
+  const getSecrets = async ({
+    actorId,
+    path,
+    environment,
+    projectId,
+    actor,
+    actorOrgId,
+    actorAuthMethod,
+    includeImports,
+    recursive
+  }: TGetSecretsDTO) => {
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
+    let paths: { folderId: string; path: string }[] = [];
+
+    if (recursive) {
+      const getPaths = recursivelyGetSecretPaths({
+        permissionService,
+        folderDAL,
+        projectEnvDAL
+      });
+
+      const deepPaths = await getPaths({
+        projectId,
+        environment,
+        currentPath: path,
+        auth: {
+          actor,
+          actorId,
+          actorAuthMethod,
+          actorOrgId
+        }
+      });
+
+      if (!deepPaths) return { secrets: [], imports: [] };
+
+      paths = deepPaths.map(({ folderId, path: p }) => ({ folderId, path: p }));
+    } else {
+      ForbiddenError.from(permission).throwUnlessCan(
+        ProjectPermissionActions.Read,
+        subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
+      );
+
+      const folder = await folderDAL.findBySecretPath(projectId, environment, path);
+      if (!folder) return { secrets: [], imports: [] };
+
+      paths = [{ folderId: folder.id, path }];
+    }
+
+    const groupedPaths = groupBy(paths, (p) => p.folderId);
+
+    const secrets = await secretDAL.findByFolderIds(
+      paths.map((p) => p.folderId),
+      actorId
     );
 
-    const folder = await folderDAL.findBySecretPath(projectId, environment, path);
-    if (!folder) return { secrets: [], imports: [] };
-    const folderId = folder.id;
-
-    const secrets = await secretDAL.findByFolderId(folderId, actorId);
     if (includeImports) {
-      const secretImports = await secretImportDAL.find({ folderId });
-      const allowedImports = secretImports.filter(({ importEnv, importPath }) =>
+      const secretImports = await secretImportDAL.findByFolderIds(paths.map((p) => p.folderId));
+      const allowedImports = secretImports.filter(({ importEnv, importPath, isReplication }) =>
+        !isReplication &&
         // if its service token allow full access over imported one
         actor === ActorType.SERVICE
           ? true
@@ -505,19 +621,36 @@ export const secretServiceFactory = ({
       const importedSecrets = await fnSecretsFromImports({
         allowedImports,
         secretDAL,
-        folderDAL
+        folderDAL,
+        secretImportDAL
       });
+
       return {
-        secrets: secrets.map((el) => ({ ...el, workspace: projectId, environment })),
+        secrets: secrets.map((secret) => ({
+          ...secret,
+          workspace: projectId,
+          environment,
+          secretPath: groupedPaths[secret.folderId][0].path
+        })),
         imports: importedSecrets
       };
     }
-    return { secrets: secrets.map((el) => ({ ...el, workspace: projectId, environment })) };
+
+    return {
+      secrets: secrets.map((secret) => ({
+        ...secret,
+        workspace: projectId,
+        environment,
+        secretPath: groupedPaths[secret.folderId][0].path
+      }))
+    };
   };
 
   const getSecretByName = async ({
     actorId,
     actor,
+    actorOrgId,
+    actorAuthMethod,
     projectId,
     environment,
     path,
@@ -526,29 +659,52 @@ export const secretServiceFactory = ({
     version,
     includeImports
   }: TGetASecretDTO) => {
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, projectId);
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
     ForbiddenError.from(permission).throwUnlessCan(
       ProjectPermissionActions.Read,
       subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
     );
     const folder = await folderDAL.findBySecretPath(projectId, environment, path);
-    if (!folder) throw new BadRequestError({ message: "Folder not  found", name: "Create secret" });
+    if (!folder)
+      throw new NotFoundError({
+        message: `Folder with path '${path}' in environment with slug '${environment}' not found`,
+        name: "GetSecretByName"
+      });
     const folderId = folder.id;
 
     const secretBlindIndex = await interalGenSecBlindIndexByName(projectId, secretName);
 
-    const secret = await (typeof version !== undefined
-      ? secretDAL.findOne({
+    // Case: The old python SDK uses incorrect logic https://github.com/Infisical/infisical-python/blob/main/infisical/client/infisicalclient.py#L89.
+    // Fetch secrets using service tokens cannot fetch personal secrets, only shared.
+    // The mongo backend used to correct this mistake, this line also adds it to current backend
+    // Mongo backend check: https://github.com/Infisical/infisical-mongo/blob/main/backend/src/helpers/secrets.ts#L658
+    let secretType = type;
+    if (actor === ActorType.SERVICE) {
+      logger.info(
+        `secretServiceFactory: overriding secret type for service token [projectId=${projectId}] [factoryFunctionName=getSecretByName]`
+      );
+      secretType = SecretType.Shared;
+    }
+
+    const secret = await (version === undefined
+      ? secretDAL.findOneWithTags({
           folderId,
-          type,
-          userId: type === SecretType.Personal ? actorId : null,
+          type: secretType,
+          userId: secretType === SecretType.Personal ? actorId : null,
           secretBlindIndex
         })
       : secretVersionDAL
           .findOne({
             folderId,
-            type,
-            userId: type === SecretType.Personal ? actorId : null,
+            type: secretType,
+            userId: secretType === SecretType.Personal ? actorId : null,
             secretBlindIndex
           })
           .then((el) => SecretsSchema.parse({ ...el, id: el.secretId })));
@@ -556,7 +712,7 @@ export const secretServiceFactory = ({
     // then search for imported secrets
     // here we consider the import order also thus starting from bottom
     if (!secret && includeImports) {
-      const secretImports = await secretImportDAL.find({ folderId });
+      const secretImports = await secretImportDAL.find({ folderId, isReplication: false });
       const allowedImports = secretImports.filter(({ importEnv, importPath }) =>
         // if its service token allow full access over imported one
         actor === ActorType.SERVICE
@@ -572,7 +728,8 @@ export const secretServiceFactory = ({
       const importedSecrets = await fnSecretsFromImports({
         allowedImports,
         secretDAL,
-        folderDAL
+        folderDAL,
+        secretImportDAL
       });
       for (let i = importedSecrets.length - 1; i >= 0; i -= 1) {
         for (let j = 0; j < importedSecrets[i].secrets.length; j += 1) {
@@ -580,50 +737,68 @@ export const secretServiceFactory = ({
             return {
               ...importedSecrets[i].secrets[j],
               workspace: projectId,
-              environment: importedSecrets[i].environment
+              environment: importedSecrets[i].environment,
+              secretPath: importedSecrets[i].secretPath
             };
           }
         }
       }
     }
-    if (!secret) throw new BadRequestError({ message: "Secret not found" });
+    if (!secret) throw new NotFoundError({ message: `Secret with name '${secretName}' not found` });
 
-    return { ...secret, workspace: projectId, environment };
+    return { ...secret, workspace: projectId, environment, secretPath: path };
   };
 
   const createManySecret = async ({
     path,
     actor,
     actorId,
+    actorAuthMethod,
+    actorOrgId,
     environment,
     projectId,
     secrets: inputSecrets
   }: TCreateBulkSecretDTO) => {
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, projectId);
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
     ForbiddenError.from(permission).throwUnlessCan(
       ProjectPermissionActions.Create,
       subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
     );
 
+    await projectDAL.checkProjectUpgradeStatus(projectId);
+
     const folder = await folderDAL.findBySecretPath(projectId, environment, path);
-    if (!folder) throw new BadRequestError({ message: "Folder not  found", name: "Create secret" });
+    if (!folder)
+      throw new NotFoundError({
+        message: `Folder with path '${path}' in environment with slug '${environment}' not found`,
+        name: "CreateManySecret"
+      });
     const folderId = folder.id;
 
     const blindIndexCfg = await secretBlindIndexDAL.findOne({ projectId });
-    if (!blindIndexCfg) throw new BadRequestError({ message: "Blind index not found", name: "Update secret" });
+    if (!blindIndexCfg) throw new NotFoundError({ message: "Blind index not found", name: "Create secret" });
 
     const { keyName2BlindIndex } = await fnSecretBlindIndexCheck({
       inputSecrets,
       folderId,
       isNew: true,
-      blindIndexCfg
+      blindIndexCfg,
+      secretDAL
     });
 
     // get all tags
     const tagIds = inputSecrets.flatMap(({ tags = [] }) => tags);
     const tags = tagIds.length ? await secretTagDAL.findManyTagsById(projectId, tagIds) : [];
-    if (tags.length !== tagIds.length) throw new BadRequestError({ message: "Tag not found" });
+    if (tags.length !== tagIds.length) throw new NotFoundError({ message: "One or more tags not found" });
 
+    const references = await getSecretReference(projectId);
     const newSecrets = await secretDAL.transaction(async (tx) =>
       fnSecretBulkInsert({
         inputSecrets: inputSecrets.map(({ secretName, ...el }) => ({
@@ -632,15 +807,31 @@ export const secretServiceFactory = ({
           secretBlindIndex: keyName2BlindIndex[secretName],
           type: SecretType.Shared,
           algorithm: SecretEncryptionAlgo.AES_256_GCM,
-          keyEncoding: SecretKeyEncoding.UTF8
+          keyEncoding: SecretKeyEncoding.UTF8,
+          references: references({
+            ciphertext: el.secretValueCiphertext,
+            iv: el.secretValueIV,
+            tag: el.secretValueTag
+          })
         })),
         folderId,
+        secretDAL,
+        secretVersionDAL,
+        secretTagDAL,
+        secretVersionTagDAL,
         tx
       })
     );
 
     await snapshotService.performSnapshot(folderId);
-    await secretQueueService.syncSecrets({ secretPath: path, projectId, environment });
+    await secretQueueService.syncSecrets({
+      actor,
+      actorId,
+      secretPath: path,
+      projectId,
+      orgId: actorOrgId,
+      environmentSlug: folder.environment.slug
+    });
 
     return newSecrets;
   };
@@ -649,28 +840,45 @@ export const secretServiceFactory = ({
     path,
     actor,
     actorId,
+    actorOrgId,
+    actorAuthMethod,
     environment,
     projectId,
     secrets: inputSecrets
   }: TUpdateBulkSecretDTO) => {
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, projectId);
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
     ForbiddenError.from(permission).throwUnlessCan(
-      ProjectPermissionActions.Create,
+      ProjectPermissionActions.Edit,
       subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
     );
 
+    await projectDAL.checkProjectUpgradeStatus(projectId);
+
     const folder = await folderDAL.findBySecretPath(projectId, environment, path);
-    if (!folder) throw new BadRequestError({ message: "Folder not  found", name: "Create secret" });
+    if (!folder)
+      throw new NotFoundError({
+        message: `Folder with path '${path}' in environment with slug '${environment}' not found`,
+        name: "UpdateManySecret"
+      });
     const folderId = folder.id;
 
     const blindIndexCfg = await secretBlindIndexDAL.findOne({ projectId });
-    if (!blindIndexCfg) throw new BadRequestError({ message: "Blind index not found", name: "Update secret" });
+    if (!blindIndexCfg) throw new NotFoundError({ message: "Blind index not found", name: "Update secret" });
 
     const { keyName2BlindIndex } = await fnSecretBlindIndexCheck({
       inputSecrets,
       folderId,
       isNew: false,
-      blindIndexCfg
+      blindIndexCfg,
+      secretDAL
     });
 
     // now find any secret that needs to update its name
@@ -680,13 +888,16 @@ export const secretServiceFactory = ({
       inputSecrets: nameUpdatedSecrets,
       folderId,
       isNew: true,
-      blindIndexCfg
+      blindIndexCfg,
+      secretDAL
     });
 
     // get all tags
     const tagIds = inputSecrets.flatMap(({ tags = [] }) => tags);
     const tags = tagIds.length ? await secretTagDAL.findManyTagsById(projectId, tagIds) : [];
-    if (tagIds.length !== tags.length) throw new BadRequestError({ message: "Tag not found" });
+    if (tagIds.length !== tags.length) throw new NotFoundError({ message: "One or more tags not found" });
+
+    const references = await getSecretReference(projectId);
     const secrets = await secretDAL.transaction(async (tx) =>
       fnSecretBulkUpdate({
         folderId,
@@ -703,14 +914,33 @@ export const secretServiceFactory = ({
                 ? newKeyName2BlindIndex[newSecretName]
                 : keyName2BlindIndex[secretName],
             algorithm: SecretEncryptionAlgo.AES_256_GCM,
-            keyEncoding: SecretKeyEncoding.UTF8
+            keyEncoding: SecretKeyEncoding.UTF8,
+            references:
+              el.secretValueIV && el.secretValueTag
+                ? references({
+                    ciphertext: el.secretValueCiphertext,
+                    iv: el.secretValueIV,
+                    tag: el.secretValueTag
+                  })
+                : undefined
           }
-        }))
+        })),
+        secretDAL,
+        secretVersionDAL,
+        secretTagDAL,
+        secretVersionTagDAL
       })
     );
 
     await snapshotService.performSnapshot(folderId);
-    await secretQueueService.syncSecrets({ secretPath: path, projectId, environment });
+    await secretQueueService.syncSecrets({
+      actor,
+      actorId,
+      secretPath: path,
+      projectId,
+      orgId: actorOrgId,
+      environmentSlug: folder.environment.slug
+    });
 
     return secrets;
   };
@@ -721,30 +951,52 @@ export const secretServiceFactory = ({
     environment,
     projectId,
     actor,
-    actorId
+    actorId,
+    actorAuthMethod,
+    actorOrgId
   }: TDeleteBulkSecretDTO) => {
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, projectId);
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
     ForbiddenError.from(permission).throwUnlessCan(
-      ProjectPermissionActions.Create,
+      ProjectPermissionActions.Delete,
       subject(ProjectPermissionSub.Secrets, { environment, secretPath: path })
     );
 
+    await projectDAL.checkProjectUpgradeStatus(projectId);
+
     const folder = await folderDAL.findBySecretPath(projectId, environment, path);
-    if (!folder) throw new BadRequestError({ message: "Folder not  found", name: "Create secret" });
+    if (!folder)
+      throw new NotFoundError({
+        message: `Folder with path '${path}' in environment with slug '${environment}' not found`,
+        name: "DeleteManySecret"
+      });
     const folderId = folder.id;
 
     const blindIndexCfg = await secretBlindIndexDAL.findOne({ projectId });
-    if (!blindIndexCfg) throw new BadRequestError({ message: "Blind index not found", name: "Update secret" });
+    if (!blindIndexCfg)
+      throw new NotFoundError({
+        message: `Blind index for project with ID '${projectId}' not found`,
+        name: "DeleteManySecret"
+      });
 
     const { keyName2BlindIndex } = await fnSecretBlindIndexCheck({
       inputSecrets,
       folderId,
       isNew: false,
-      blindIndexCfg
+      blindIndexCfg,
+      secretDAL
     });
 
-    const secretsDeleted = await secretDAL.transaction(async (tx) =>
-      fnSecretBulkDelete({
+    const secretsDeleted = await secretDAL.transaction(async (tx) => {
+      const secrets = await fnSecretBulkDelete({
+        secretDAL,
+        secretQueueService,
         inputSecrets: inputSecrets.map(({ type, secretName }) => ({
           secretBlindIndex: keyName2BlindIndex[secretName],
           type
@@ -753,49 +1005,370 @@ export const secretServiceFactory = ({
         folderId,
         actorId,
         tx
-      })
-    );
+      });
+
+      for await (const secret of secrets) {
+        if (secret.secretReminderRepeatDays !== null && secret.secretReminderRepeatDays !== undefined) {
+          await secretQueueService.removeSecretReminder({
+            repeatDays: secret.secretReminderRepeatDays,
+            secretId: secret.id
+          });
+        }
+      }
+
+      return secrets;
+    });
 
     await snapshotService.performSnapshot(folderId);
-    await secretQueueService.syncSecrets({ secretPath: path, projectId, environment });
+    await secretQueueService.syncSecrets({
+      actor,
+      actorId,
+      secretPath: path,
+      projectId,
+      orgId: actorOrgId,
+      environmentSlug: folder.environment.slug
+    });
 
     return secretsDeleted;
   };
 
-  const listSecretVersionsBySecretId = async ({ actorId, actor, limit, offset, secretId }: TListSecretVersionDTO) => {
-    const secret = await secretDAL.findById(secretId);
-    if (!secret) throw new BadRequestError({ message: "Failed to find secret" });
+  const getSecretsCount = async ({
+    projectId,
+    path,
+    actor,
+    actorId,
+    actorOrgId,
+    actorAuthMethod,
+    environment,
+    tagSlugs = [],
+    ...v2Params
+  }: Pick<
+    TGetSecretsRawDTO,
+    | "projectId"
+    | "path"
+    | "actor"
+    | "actorId"
+    | "actorOrgId"
+    | "actorAuthMethod"
+    | "environment"
+    | "tagSlugs"
+    | "search"
+  >) => {
+    const { shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
 
-    const folder = await folderDAL.findById(secret.folderId);
-    if (!folder) throw new BadRequestError({ message: "Folder not found" });
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, folder.projectId);
-    ForbiddenError.from(permission).throwUnlessCan(ProjectPermissionActions.Read, ProjectPermissionSub.SecretRollback);
+    if (!shouldUseSecretV2Bridge)
+      throw new BadRequestError({
+        message: "Project version does not support pagination",
+        name: "PaginationNotSupportedError"
+      });
 
-    const secretVersions = await secretVersionDAL.find({ secretId }, { limit, offset, sort: [["createdAt", "desc"]] });
-    return secretVersions;
+    const count = await secretV2BridgeService.getSecretsCount({
+      projectId,
+      actorId,
+      actor,
+      actorOrgId,
+      environment,
+      path,
+      actorAuthMethod,
+      tagSlugs,
+      ...v2Params
+    });
+
+    return count;
   };
 
-  const getSecretsRaw = async ({ projectId, path, actor, actorId, environment, includeImports }: TGetSecretsRawDTO) => {
-    const botKey = await projectBotService.getBotKey(projectId);
-    if (!botKey) throw new BadRequestError({ message: "Project bot not found", name: "bot_not_found_error" });
+  const getSecretsCountMultiEnv = async ({
+    projectId,
+    path,
+    actor,
+    actorId,
+    actorOrgId,
+    actorAuthMethod,
+    environments,
+    ...v2Params
+  }: Pick<
+    TGetSecretsRawDTO,
+    "projectId" | "path" | "actor" | "actorId" | "actorOrgId" | "actorAuthMethod" | "search"
+  > & { environments: string[]; isInternal?: boolean }) => {
+    const { shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+
+    if (!shouldUseSecretV2Bridge)
+      throw new BadRequestError({
+        message: "Project version does not support pagination",
+        name: "PaginationNotSupportedError"
+      });
+
+    const count = await secretV2BridgeService.getSecretsCountMultiEnv({
+      projectId,
+      actorId,
+      actor,
+      actorOrgId,
+      environments,
+      path,
+      actorAuthMethod,
+      ...v2Params
+    });
+
+    return count;
+  };
+
+  const getSecretsRawMultiEnv = async ({
+    projectId,
+    path,
+    actor,
+    actorId,
+    actorOrgId,
+    actorAuthMethod,
+    environments,
+    ...params
+  }: Omit<TGetSecretsRawDTO, "environment" | "includeImports" | "expandSecretReferences" | "recursive" | "tagSlugs"> & {
+    environments: string[];
+    isInternal?: boolean;
+  }) => {
+    const { shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+
+    if (!shouldUseSecretV2Bridge)
+      throw new BadRequestError({
+        message: "Project version does not support pagination",
+        name: "PaginationNotSupportError"
+      });
+
+    const secrets = await secretV2BridgeService.getSecretsMultiEnv({
+      projectId,
+      actorId,
+      actor,
+      actorOrgId,
+      environments,
+      path,
+      actorAuthMethod,
+      ...params
+    });
+
+    return secrets;
+  };
+
+  const getSecretReferenceTree = async (dto: TGetSecretReferencesTreeDTO) => {
+    const { shouldUseSecretV2Bridge } = await projectBotService.getBotKey(dto.projectId);
+
+    if (!shouldUseSecretV2Bridge)
+      throw new BadRequestError({
+        message: "Project version does not support secret reference tree",
+        name: "SecretReferenceTreeNotSupported"
+      });
+
+    return secretV2BridgeService.getSecretReferenceTree(dto);
+  };
+
+  const getSecretAccessList = async (dto: TGetSecretAccessListDTO) => {
+    const { environment, secretPath, secretName, projectId } = dto;
+    const plan = await licenseService.getPlan(dto.actorOrgId);
+    if (!plan.secretAccessInsights) {
+      throw new BadRequestError({
+        message: "Failed to fetch secret access list due to plan restriction. Upgrade your plan."
+      });
+    }
+
+    const secret = await secretV2BridgeService.getSecretByName({
+      actor: dto.actor,
+      actorId: dto.actorId,
+      actorOrgId: dto.actorOrgId,
+      actorAuthMethod: dto.actorAuthMethod,
+      projectId,
+      secretName,
+      path: secretPath,
+      environment,
+      type: "shared"
+    });
+
+    const { userPermissions, identityPermissions, groupPermissions } = await permissionService.getProjectPermissions(
+      dto.projectId
+    );
+
+    const attachAllowedActions = (
+      entityPermission:
+        | (typeof userPermissions)[number]
+        | (typeof identityPermissions)[number]
+        | (typeof groupPermissions)[number]
+    ) => {
+      const allowedActions = [
+        ProjectPermissionActions.Read,
+        ProjectPermissionActions.Delete,
+        ProjectPermissionActions.Create,
+        ProjectPermissionActions.Edit
+      ].filter((action) =>
+        entityPermission.permission.can(
+          action,
+          subject(ProjectPermissionSub.Secrets, {
+            environment,
+            secretPath,
+            secretName,
+            secretTags: secret?.tags?.map((el) => el.slug)
+          })
+        )
+      );
+
+      return {
+        ...entityPermission,
+        allowedActions
+      };
+    };
+
+    const usersWithAccess = userPermissions.map(attachAllowedActions).filter((user) => user.allowedActions.length > 0);
+    const identitiesWithAccess = identityPermissions
+      .map(attachAllowedActions)
+      .filter((identity) => identity.allowedActions.length > 0);
+    const groupsWithAccess = groupPermissions
+      .map(attachAllowedActions)
+      .filter((group) => group.allowedActions.length > 0);
+
+    return { users: usersWithAccess, identities: identitiesWithAccess, groups: groupsWithAccess };
+  };
+
+  const getSecretsRaw = async ({
+    projectId,
+    path,
+    actor,
+    actorId,
+    actorOrgId,
+    actorAuthMethod,
+    environment,
+    includeImports,
+    expandSecretReferences,
+    recursive,
+    tagSlugs = [],
+    ...paramsV2
+  }: TGetSecretsRawDTO) => {
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    if (shouldUseSecretV2Bridge) {
+      const { secrets, imports } = await secretV2BridgeService.getSecrets({
+        projectId,
+        expandSecretReferences,
+        actorId,
+        actor,
+        actorOrgId,
+        environment,
+        path,
+        recursive,
+        actorAuthMethod,
+        includeImports,
+        tagSlugs,
+        ...paramsV2
+      });
+      return { secrets, imports };
+    }
+
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
 
     const { secrets, imports } = await getSecrets({
       actorId,
       projectId,
       environment,
       actor,
+      actorOrgId,
+      actorAuthMethod,
       path,
-      includeImports
+      includeImports,
+      recursive
     });
 
-    return {
-      secrets: secrets.map((el) => decryptSecretRaw(el, botKey)),
-      imports: (imports || [])?.map(({ secrets: importedSecrets, ...el }) => ({
-        ...el,
-        secrets: importedSecrets.map((sec) =>
-          decryptSecretRaw({ ...sec, environment: el.environment, workspace: projectId }, botKey)
+    const decryptedSecrets = secrets.map((el) => decryptSecretRaw(el, botKey));
+    const filteredSecrets = tagSlugs.length
+      ? decryptedSecrets.filter((secret) => Boolean(secret.tags?.find((el) => tagSlugs.includes(el.slug))))
+      : decryptedSecrets;
+    const processedImports = (imports || [])?.map(({ secrets: importedSecrets, ...el }) => {
+      const decryptedImportSecrets = importedSecrets.map((sec) =>
+        decryptSecretRaw(
+          { ...sec, environment: el.environment, workspace: projectId, secretPath: el.secretPath },
+          botKey
         )
-      }))
+      );
+
+      // secret-override to handle duplicate keys from different import levels
+      // this prioritizes secret values from direct imports
+      const importedKeys = new Set<string>();
+      const importedEntries = decryptedImportSecrets.reduce(
+        (
+          accum: {
+            secretKey: string;
+            secretPath: string;
+            workspace: string;
+            environment: string;
+            secretValue: string;
+            secretComment: string;
+            version: number;
+            type: string;
+            _id: string;
+            id: string;
+            user: string | null | undefined;
+            skipMultilineEncoding: boolean | null | undefined;
+          }[],
+          sec
+        ) => {
+          if (!importedKeys.has(sec.secretKey)) {
+            importedKeys.add(sec.secretKey);
+            return [...accum, sec];
+          }
+          return accum;
+        },
+        []
+      );
+
+      return {
+        ...el,
+        secrets: importedEntries
+      };
+    });
+
+    const expandSecret = interpolateSecrets({
+      folderDAL,
+      projectId,
+      secretDAL,
+      secretEncKey: botKey
+    });
+
+    if (expandSecretReferences) {
+      const secretsGroupByPath = groupBy(filteredSecrets, (i) => i.secretPath);
+      await Promise.allSettled(
+        Object.keys(secretsGroupByPath).map((groupedPath) =>
+          Promise.allSettled(
+            secretsGroupByPath[groupedPath].map(async (decryptedSecret, index) => {
+              const expandedSecretValue = await expandSecret({
+                value: decryptedSecret.secretValue,
+                secretPath: groupedPath,
+                environment,
+                skipMultilineEncoding: decryptedSecret.skipMultilineEncoding
+              });
+              // eslint-disable-next-line no-param-reassign
+              secretsGroupByPath[groupedPath][index].secretValue = expandedSecretValue || "";
+            })
+          )
+        )
+      );
+      await Promise.allSettled(
+        processedImports.map((processedImport) =>
+          Promise.allSettled(
+            processedImport.secrets.map(async (decryptedSecret, index) => {
+              const expandedSecretValue = await expandSecret({
+                value: decryptedSecret.secretValue,
+                secretPath: path,
+                environment,
+                skipMultilineEncoding: decryptedSecret.skipMultilineEncoding
+              });
+              // eslint-disable-next-line no-param-reassign
+              processedImport.secrets[index].secretValue = expandedSecretValue || "";
+            })
+          )
+        )
+      );
+    }
+
+    return {
+      secrets: filteredSecrets,
+      imports: processedImports
     };
   };
 
@@ -804,27 +1377,74 @@ export const secretServiceFactory = ({
     path,
     actor,
     environment,
-    projectId,
+    projectId: workspaceId,
+    expandSecretReferences,
+    projectSlug,
     actorId,
+    actorOrgId,
+    actorAuthMethod,
     secretName,
     includeImports,
     version
   }: TGetASecretRawDTO) => {
-    const botKey = await projectBotService.getBotKey(projectId);
-    if (!botKey) throw new BadRequestError({ message: "Project bot not found", name: "bot_not_found_error" });
+    const projectId = workspaceId || (await projectDAL.findProjectBySlug(projectSlug as string, actorOrgId)).id;
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    if (shouldUseSecretV2Bridge) {
+      const secret = await secretV2BridgeService.getSecretByName({
+        environment,
+        projectId,
+        includeImports,
+        actorAuthMethod,
+        path,
+        actorOrgId,
+        actor,
+        actorId,
+        expandSecretReferences,
+        type,
+        secretName
+      });
 
-    const secret = await getSecretByName({
+      return secret;
+    }
+
+    const encryptedSecret = await getSecretByName({
       actorId,
       projectId,
+      actorAuthMethod,
       environment,
       actor,
+      actorOrgId,
       path,
       secretName,
       type,
       includeImports,
       version
     });
-    return decryptSecretRaw(secret, botKey);
+
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
+    const decryptedSecret = decryptSecretRaw(encryptedSecret, botKey);
+
+    if (expandSecretReferences) {
+      const expandSecret = interpolateSecrets({
+        folderDAL,
+        projectId,
+        secretDAL,
+        secretEncKey: botKey
+      });
+      const expandedSecretValue = await expandSecret({
+        environment,
+        secretPath: path,
+        value: decryptedSecret.secretValue,
+        skipMultilineEncoding: decryptedSecret.skipMultilineEncoding
+      });
+      decryptedSecret.secretValue = expandedSecretValue || "";
+    }
+
+    return decryptedSecret;
   };
 
   const createSecretRaw = async ({
@@ -833,18 +1453,112 @@ export const secretServiceFactory = ({
     projectId,
     environment,
     actor,
+    actorOrgId,
+    actorAuthMethod,
     type,
     secretPath,
     secretValue,
     secretComment,
-    skipMultilineEncoding
+    skipMultilineEncoding,
+    tagIds,
+    secretReminderNote,
+    secretReminderRepeatDays,
+    secretMetadata
   }: TCreateSecretRawDTO) => {
-    const botKey = await projectBotService.getBotKey(projectId);
-    if (!botKey) throw new BadRequestError({ message: "Project bot not found", name: "bot_not_found_error" });
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    const policy =
+      actor === ActorType.USER && type === SecretType.Shared
+        ? await secretApprovalPolicyService.getSecretApprovalPolicy(projectId, environment, secretPath)
+        : undefined;
+    if (shouldUseSecretV2Bridge) {
+      if (policy) {
+        const approval = await secretApprovalRequestService.generateSecretApprovalRequestV2Bridge({
+          policy,
+          secretPath,
+          environment,
+          projectId,
+          actor,
+          actorId,
+          actorOrgId,
+          actorAuthMethod,
+          data: {
+            [SecretOperations.Create]: [
+              {
+                secretKey: secretName,
+                skipMultilineEncoding,
+                secretComment,
+                secretValue,
+                tagIds,
+                reminderNote: secretReminderNote,
+                reminderRepeatDays: secretReminderRepeatDays,
+                secretMetadata
+              }
+            ]
+          }
+        });
+        return { type: SecretProtectionType.Approval as const, approval };
+      }
 
+      const secret = await secretV2BridgeService.createSecret({
+        secretName,
+        type,
+        actorId,
+        actor,
+        actorOrgId,
+        actorAuthMethod,
+        projectId,
+        environment,
+        secretPath,
+        secretComment,
+        secretValue,
+        tagIds,
+        secretReminderNote,
+        skipMultilineEncoding,
+        secretReminderRepeatDays,
+        secretMetadata
+      });
+      return { secret, type: SecretProtectionType.Direct as const };
+    }
+
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
     const secretKeyEncrypted = encryptSymmetric128BitHexKeyUTF8(secretName, botKey);
     const secretValueEncrypted = encryptSymmetric128BitHexKeyUTF8(secretValue || "", botKey);
     const secretCommentEncrypted = encryptSymmetric128BitHexKeyUTF8(secretComment || "", botKey);
+    if (policy) {
+      const approval = await secretApprovalRequestService.generateSecretApprovalRequest({
+        policy,
+        secretPath,
+        environment,
+        projectId,
+        actor,
+        actorId,
+        actorOrgId,
+        actorAuthMethod,
+        data: {
+          [SecretOperations.Create]: [
+            {
+              secretName,
+              secretKeyCiphertext: secretKeyEncrypted.ciphertext,
+              secretKeyIV: secretKeyEncrypted.iv,
+              secretKeyTag: secretKeyEncrypted.tag,
+              secretValueCiphertext: secretValueEncrypted.ciphertext,
+              secretValueIV: secretValueEncrypted.iv,
+              secretValueTag: secretValueEncrypted.tag,
+              secretCommentCiphertext: secretCommentEncrypted.ciphertext,
+              secretCommentIV: secretCommentEncrypted.iv,
+              secretCommentTag: secretCommentEncrypted.tag,
+              skipMultilineEncoding,
+              tagIds
+            }
+          ]
+        }
+      });
+      return { type: SecretProtectionType.Approval as const, approval };
+    }
 
     const secret = await createSecret({
       secretName,
@@ -854,6 +1568,8 @@ export const secretServiceFactory = ({
       path: secretPath,
       actor,
       actorId,
+      actorAuthMethod,
+      actorOrgId,
       secretKeyCiphertext: secretKeyEncrypted.ciphertext,
       secretKeyIV: secretKeyEncrypted.iv,
       secretKeyTag: secretKeyEncrypted.tag,
@@ -863,13 +1579,13 @@ export const secretServiceFactory = ({
       secretCommentCiphertext: secretCommentEncrypted.ciphertext,
       secretCommentIV: secretCommentEncrypted.iv,
       secretCommentTag: secretCommentEncrypted.tag,
-      skipMultilineEncoding
+      skipMultilineEncoding,
+      secretReminderRepeatDays,
+      secretReminderNote,
+      tags: tagIds
     });
 
-    await snapshotService.performSnapshot(secret.folderId);
-    await secretQueueService.syncSecrets({ secretPath, projectId, environment });
-
-    return decryptSecretRaw(secret, botKey);
+    return { type: SecretProtectionType.Direct as const, secret: decryptSecretRaw(secret, botKey) };
   };
 
   const updateSecretRaw = async ({
@@ -878,15 +1594,121 @@ export const secretServiceFactory = ({
     projectId,
     environment,
     actor,
+    actorOrgId,
+    actorAuthMethod,
     type,
     secretPath,
     secretValue,
-    skipMultilineEncoding
+    skipMultilineEncoding,
+    tagIds,
+    secretReminderNote,
+    secretReminderRepeatDays,
+    metadata,
+    secretComment,
+    newSecretName,
+    secretMetadata
   }: TUpdateSecretRawDTO) => {
-    const botKey = await projectBotService.getBotKey(projectId);
-    if (!botKey) throw new BadRequestError({ message: "Project bot not found", name: "bot_not_found_error" });
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    const policy =
+      actor === ActorType.USER && type === SecretType.Shared
+        ? await secretApprovalPolicyService.getSecretApprovalPolicy(projectId, environment, secretPath)
+        : undefined;
+    if (shouldUseSecretV2Bridge) {
+      if (policy) {
+        const approval = await secretApprovalRequestService.generateSecretApprovalRequestV2Bridge({
+          policy,
+          secretPath,
+          environment,
+          projectId,
+          actor,
+          actorId,
+          actorOrgId,
+          actorAuthMethod,
+          data: {
+            [SecretOperations.Update]: [
+              {
+                secretKey: secretName,
+                newSecretName,
+                skipMultilineEncoding,
+                secretComment,
+                secretValue,
+                tagIds,
+                reminderNote: secretReminderNote,
+                reminderRepeatDays: secretReminderRepeatDays,
+                secretMetadata
+              }
+            ]
+          }
+        });
+        return { type: SecretProtectionType.Approval as const, approval };
+      }
+      const secret = await secretV2BridgeService.updateSecret({
+        secretReminderRepeatDays,
+        skipMultilineEncoding,
+        secretReminderNote,
+        tagIds,
+        secretComment,
+        secretPath,
+        environment,
+        projectId,
+        actorAuthMethod,
+        actorOrgId,
+        actor,
+        actorId,
+        type,
+        secretName,
+        newSecretName,
+        metadata,
+        secretValue,
+        secretMetadata
+      });
+      return { type: SecretProtectionType.Direct as const, secret };
+    }
+
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
 
     const secretValueEncrypted = encryptSymmetric128BitHexKeyUTF8(secretValue || "", botKey);
+    const secretCommentEncrypted = encryptSymmetric128BitHexKeyUTF8(secretComment || "", botKey);
+    const secretKeyEncrypted = encryptSymmetric128BitHexKeyUTF8(newSecretName || secretName, botKey);
+
+    if (policy) {
+      const approval = await secretApprovalRequestService.generateSecretApprovalRequest({
+        policy,
+        secretPath,
+        environment,
+        projectId,
+        actor,
+        actorId,
+        actorOrgId,
+        actorAuthMethod,
+        data: {
+          [SecretOperations.Update]: [
+            {
+              secretName,
+              newSecretName,
+              skipMultilineEncoding,
+              secretKeyCiphertext: secretKeyEncrypted.ciphertext,
+              secretKeyIV: secretKeyEncrypted.iv,
+              secretKeyTag: secretKeyEncrypted.tag,
+              secretValueCiphertext: secretValueEncrypted.ciphertext,
+              secretValueIV: secretValueEncrypted.iv,
+              secretValueTag: secretValueEncrypted.tag,
+              secretCommentCiphertext: secretCommentEncrypted.ciphertext,
+              secretCommentIV: secretCommentEncrypted.iv,
+              secretCommentTag: secretCommentEncrypted.tag,
+              tagIds,
+              secretReminderNote,
+              secretReminderRepeatDays
+            }
+          ]
+        }
+      });
+      return { approval, type: SecretProtectionType.Approval as const };
+    }
 
     const secret = await updateSecret({
       secretName,
@@ -896,16 +1718,27 @@ export const secretServiceFactory = ({
       path: secretPath,
       actor,
       actorId,
+      actorOrgId,
+      actorAuthMethod,
       secretValueCiphertext: secretValueEncrypted.ciphertext,
       secretValueIV: secretValueEncrypted.iv,
       secretValueTag: secretValueEncrypted.tag,
-      skipMultilineEncoding
+      skipMultilineEncoding,
+      tags: tagIds,
+      metadata,
+      secretReminderRepeatDays,
+      secretReminderNote,
+      newSecretName,
+      secretKeyIV: secretKeyEncrypted.iv,
+      secretKeyTag: secretKeyEncrypted.tag,
+      secretKeyCiphertext: secretKeyEncrypted.ciphertext,
+      secretCommentIV: secretCommentEncrypted.iv,
+      secretCommentTag: secretCommentEncrypted.tag,
+      secretCommentCiphertext: secretCommentEncrypted.ciphertext
     });
 
     await snapshotService.performSnapshot(secret.folderId);
-    await secretQueueService.syncSecrets({ secretPath, projectId, environment });
-
-    return decryptSecretRaw(secret, botKey);
+    return { type: SecretProtectionType.Direct as const, secret: decryptSecretRaw(secret, botKey) };
   };
 
   const deleteSecretRaw = async ({
@@ -914,12 +1747,75 @@ export const secretServiceFactory = ({
     projectId,
     environment,
     actor,
+    actorOrgId,
+    actorAuthMethod,
     type,
     secretPath
   }: TDeleteSecretRawDTO) => {
-    const botKey = await projectBotService.getBotKey(projectId);
-    if (!botKey) throw new BadRequestError({ message: "Project bot not found", name: "bot_not_found_error" });
-
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    const policy =
+      actor === ActorType.USER && type === SecretType.Shared
+        ? await secretApprovalPolicyService.getSecretApprovalPolicy(projectId, environment, secretPath)
+        : undefined;
+    if (shouldUseSecretV2Bridge) {
+      if (policy) {
+        const approval = await secretApprovalRequestService.generateSecretApprovalRequestV2Bridge({
+          policy,
+          actorAuthMethod,
+          actorOrgId,
+          actorId,
+          actor,
+          projectId,
+          environment,
+          secretPath,
+          data: {
+            [SecretOperations.Delete]: [
+              {
+                secretKey: secretName
+              }
+            ]
+          }
+        });
+        return { type: SecretProtectionType.Approval as const, approval };
+      }
+      const secret = await secretV2BridgeService.deleteSecret({
+        secretName,
+        type,
+        actorId,
+        actor,
+        actorOrgId,
+        actorAuthMethod,
+        projectId,
+        environment,
+        secretPath
+      });
+      return { type: SecretProtectionType.Direct as const, secret };
+    }
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
+    if (policy) {
+      const approval = await secretApprovalRequestService.generateSecretApprovalRequest({
+        policy,
+        actorAuthMethod,
+        actorOrgId,
+        actorId,
+        actor,
+        projectId,
+        environment,
+        secretPath,
+        data: {
+          [SecretOperations.Delete]: [
+            {
+              secretName
+            }
+          ]
+        }
+      });
+      return { type: SecretProtectionType.Approval as const, approval };
+    }
     const secret = await deleteSecret({
       secretName,
       projectId,
@@ -927,30 +1823,1183 @@ export const secretServiceFactory = ({
       type,
       path: secretPath,
       actor,
-      actorId
+      actorId,
+      actorOrgId,
+      actorAuthMethod
     });
 
-    await snapshotService.performSnapshot(secret.folderId);
-    await secretQueueService.syncSecrets({ secretPath, projectId, environment });
-
-    return decryptSecretRaw(secret, botKey);
+    return { type: SecretProtectionType.Direct as const, secret: decryptSecretRaw(secret, botKey) };
   };
 
-  const getSecretVersions = async ({ actorId, actor, limit = 20, offset = 0, secretId }: TGetSecretVersionsDTO) => {
+  const createManySecretsRaw = async ({
+    actorId,
+    projectSlug,
+    projectId: optionalProjectId,
+    environment,
+    actor,
+    actorOrgId,
+    actorAuthMethod,
+    secretPath,
+    secrets: inputSecrets = []
+  }: TCreateManySecretRawDTO) => {
+    if (!projectSlug && !optionalProjectId)
+      throw new BadRequestError({ message: "Must provide either project slug or projectId" });
+
+    let projectId = optionalProjectId as string;
+    // pick either project slug or projectid
+    if (!optionalProjectId && projectSlug) {
+      const project = await projectDAL.findProjectBySlug(projectSlug, actorOrgId);
+      if (!project) throw new NotFoundError({ message: `Project with slug '${projectSlug}' not found` });
+      projectId = project.id;
+    }
+
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    const policy =
+      actor === ActorType.USER
+        ? await secretApprovalPolicyService.getSecretApprovalPolicy(projectId, environment, secretPath)
+        : undefined;
+    if (shouldUseSecretV2Bridge) {
+      if (policy) {
+        const approval = await secretApprovalRequestService.generateSecretApprovalRequestV2Bridge({
+          policy,
+          secretPath,
+          environment,
+          projectId,
+          actor,
+          actorId,
+          actorOrgId,
+          actorAuthMethod,
+          data: {
+            [SecretOperations.Create]: inputSecrets.map((el) => ({
+              tagIds: el.tagIds,
+              secretValue: el.secretValue,
+              secretComment: el.secretComment,
+              metadata: el.metadata,
+              skipMultilineEncoding: el.skipMultilineEncoding,
+              secretKey: el.secretKey,
+              secretMetadata: el.secretMetadata
+            }))
+          }
+        });
+        return { type: SecretProtectionType.Approval as const, approval };
+      }
+      const secrets = await secretV2BridgeService.createManySecret({
+        secretPath,
+        environment,
+        projectId,
+        actorAuthMethod,
+        actorOrgId,
+        actor,
+        actorId,
+        secrets: inputSecrets
+      });
+      return { secrets, type: SecretProtectionType.Direct as const };
+    }
+
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
+    const sanitizedSecrets = inputSecrets.map(
+      ({ secretComment, secretKey, metadata, tagIds, secretValue, skipMultilineEncoding }) => {
+        const secretKeyEncrypted = encryptSymmetric128BitHexKeyUTF8(secretKey, botKey);
+        const secretValueEncrypted = encryptSymmetric128BitHexKeyUTF8(secretValue || "", botKey);
+        const secretCommentEncrypted = encryptSymmetric128BitHexKeyUTF8(secretComment || "", botKey);
+        return {
+          secretName: secretKey,
+          skipMultilineEncoding,
+          secretKeyCiphertext: secretKeyEncrypted.ciphertext,
+          secretKeyIV: secretKeyEncrypted.iv,
+          secretKeyTag: secretKeyEncrypted.tag,
+          secretValueCiphertext: secretValueEncrypted.ciphertext,
+          secretValueIV: secretValueEncrypted.iv,
+          secretValueTag: secretValueEncrypted.tag,
+          secretCommentCiphertext: secretCommentEncrypted.ciphertext,
+          secretCommentIV: secretCommentEncrypted.iv,
+          secretCommentTag: secretCommentEncrypted.tag,
+          tags: tagIds,
+          tagIds,
+          metadata
+        };
+      }
+    );
+    if (policy) {
+      const approval = await secretApprovalRequestService.generateSecretApprovalRequest({
+        policy,
+        secretPath,
+        environment,
+        projectId,
+        actor,
+        actorId,
+        actorOrgId,
+        actorAuthMethod,
+        data: {
+          [SecretOperations.Create]: sanitizedSecrets
+        }
+      });
+      return { type: SecretProtectionType.Approval as const, approval };
+    }
+
+    const secrets = await createManySecret({
+      projectId,
+      environment,
+      path: secretPath,
+      actor,
+      actorId,
+      actorOrgId,
+      actorAuthMethod,
+      secrets: sanitizedSecrets
+    });
+
+    return {
+      type: SecretProtectionType.Direct as const,
+      secrets: secrets.map((secret) =>
+        decryptSecretRaw({ ...secret, workspace: projectId, environment, secretPath }, botKey)
+      )
+    };
+  };
+
+  const updateManySecretsRaw = async ({
+    actorId,
+    projectSlug,
+    projectId: optionalProjectId,
+    environment,
+    actor,
+    actorOrgId,
+    actorAuthMethod,
+    secretPath,
+    secrets: inputSecrets = []
+  }: TUpdateManySecretRawDTO) => {
+    if (!projectSlug && !optionalProjectId)
+      throw new BadRequestError({ message: "Must provide either project slug or projectId" });
+
+    let projectId = optionalProjectId as string;
+    if (!optionalProjectId && projectSlug) {
+      const project = await projectDAL.findProjectBySlug(projectSlug, actorOrgId);
+      if (!project) throw new NotFoundError({ message: `Project with slug '${projectSlug}' not found` });
+      projectId = project.id;
+    }
+
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    const policy =
+      actor === ActorType.USER
+        ? await secretApprovalPolicyService.getSecretApprovalPolicy(projectId, environment, secretPath)
+        : undefined;
+    if (shouldUseSecretV2Bridge) {
+      if (policy) {
+        const approval = await secretApprovalRequestService.generateSecretApprovalRequestV2Bridge({
+          policy,
+          secretPath,
+          environment,
+          projectId,
+          actor,
+          actorId,
+          actorOrgId,
+          actorAuthMethod,
+          data: {
+            [SecretOperations.Update]: inputSecrets.map((el) => ({
+              tagIds: el.tagIds,
+              secretValue: el.secretValue,
+              secretComment: el.secretComment,
+              skipMultilineEncoding: el.skipMultilineEncoding,
+              secretKey: el.secretKey,
+              secretMetadata: el.secretMetadata
+            }))
+          }
+        });
+        return { type: SecretProtectionType.Approval as const, approval };
+      }
+      const secrets = await secretV2BridgeService.updateManySecret({
+        secretPath,
+        environment,
+        projectId,
+        actorAuthMethod,
+        actorOrgId,
+        actor,
+        actorId,
+        secrets: inputSecrets
+      });
+      return { type: SecretProtectionType.Direct as const, secrets };
+    }
+
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
+    const sanitizedSecrets = inputSecrets.map(
+      ({
+        secretComment,
+        secretKey,
+        secretValue,
+        skipMultilineEncoding,
+        tagIds: tags,
+        newSecretName,
+        secretReminderNote,
+        secretReminderRepeatDays
+      }) => {
+        const secretKeyEncrypted = encryptSymmetric128BitHexKeyUTF8(newSecretName || secretKey, botKey);
+        const secretValueEncrypted = encryptSymmetric128BitHexKeyUTF8(secretValue || "", botKey);
+        const secretCommentEncrypted = encryptSymmetric128BitHexKeyUTF8(secretComment || "", botKey);
+        return {
+          secretName: secretKey,
+          newSecretName,
+          tags,
+          tagIds: tags,
+          secretReminderRepeatDays,
+          secretReminderNote,
+          type: SecretType.Shared,
+          skipMultilineEncoding,
+          secretKeyCiphertext: secretKeyEncrypted.ciphertext,
+          secretKeyIV: secretKeyEncrypted.iv,
+          secretKeyTag: secretKeyEncrypted.tag,
+          secretValueCiphertext: secretValueEncrypted.ciphertext,
+          secretValueIV: secretValueEncrypted.iv,
+          secretValueTag: secretValueEncrypted.tag,
+          secretCommentCiphertext: secretCommentEncrypted.ciphertext,
+          secretCommentIV: secretCommentEncrypted.iv,
+          secretCommentTag: secretCommentEncrypted.tag
+        };
+      }
+    );
+    if (policy) {
+      const approval = await secretApprovalRequestService.generateSecretApprovalRequest({
+        policy,
+        secretPath,
+        environment,
+        projectId,
+        actor,
+        actorId,
+        actorOrgId,
+        actorAuthMethod,
+        data: {
+          [SecretOperations.Update]: sanitizedSecrets
+        }
+      });
+
+      return { type: SecretProtectionType.Approval as const, approval };
+    }
+    const secrets = await updateManySecret({
+      projectId,
+      environment,
+      path: secretPath,
+      actor,
+      actorId,
+      actorOrgId,
+      actorAuthMethod,
+      secrets: sanitizedSecrets
+    });
+
+    return {
+      type: SecretProtectionType.Direct as const,
+      secrets: secrets.map((secret) =>
+        decryptSecretRaw({ ...secret, workspace: projectId, environment, secretPath }, botKey)
+      )
+    };
+  };
+
+  const deleteManySecretsRaw = async ({
+    actorId,
+    projectSlug,
+    projectId: optionalProjectId,
+    environment,
+    actor,
+    actorOrgId,
+    actorAuthMethod,
+    secretPath,
+    secrets: inputSecrets = []
+  }: TDeleteManySecretRawDTO) => {
+    if (!projectSlug && !optionalProjectId)
+      throw new BadRequestError({ message: "Must provide either project slug or projectId" });
+
+    let projectId = optionalProjectId as string;
+    if (!optionalProjectId && projectSlug) {
+      const project = await projectDAL.findProjectBySlug(projectSlug, actorOrgId);
+      if (!project) throw new NotFoundError({ message: `Project with slug '${projectSlug}' not found` });
+      projectId = project.id;
+    }
+
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    const policy =
+      actor === ActorType.USER
+        ? await secretApprovalPolicyService.getSecretApprovalPolicy(projectId, environment, secretPath)
+        : undefined;
+    if (shouldUseSecretV2Bridge) {
+      if (policy) {
+        const approval = await secretApprovalRequestService.generateSecretApprovalRequestV2Bridge({
+          policy,
+          actorAuthMethod,
+          actorOrgId,
+          actorId,
+          actor,
+          projectId,
+          environment,
+          secretPath,
+          data: {
+            [SecretOperations.Delete]: inputSecrets
+          }
+        });
+        return { type: SecretProtectionType.Approval as const, approval };
+      }
+      const secrets = await secretV2BridgeService.deleteManySecret({
+        secretPath,
+        environment,
+        projectId,
+        actorAuthMethod,
+        actorOrgId,
+        actor,
+        actorId,
+        secrets: inputSecrets
+      });
+      return { type: SecretProtectionType.Direct as const, secrets };
+    }
+
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
+
+    if (policy) {
+      const approval = await secretApprovalRequestService.generateSecretApprovalRequest({
+        policy,
+        actorAuthMethod,
+        actorOrgId,
+        actorId,
+        actor,
+        projectId,
+        environment,
+        secretPath,
+        data: {
+          [SecretOperations.Delete]: inputSecrets.map((el) => ({ secretName: el.secretKey }))
+        }
+      });
+      return { type: SecretProtectionType.Approval as const, approval };
+    }
+    const secrets = await deleteManySecret({
+      projectId,
+      environment,
+      path: secretPath,
+      actor,
+      actorId,
+      actorOrgId,
+      actorAuthMethod,
+      secrets: inputSecrets.map(({ secretKey, type = SecretType.Shared }) => ({ secretName: secretKey, type }))
+    });
+
+    return {
+      type: SecretProtectionType.Direct as const,
+      secrets: secrets.map((secret) =>
+        decryptSecretRaw({ ...secret, workspace: projectId, environment, secretPath }, botKey)
+      )
+    };
+  };
+
+  const getSecretVersions = async ({
+    actorId,
+    actor,
+    actorOrgId,
+    actorAuthMethod,
+    limit = 20,
+    offset = 0,
+    secretId
+  }: TGetSecretVersionsDTO) => {
+    const secretVersionV2 = await secretV2BridgeService
+      .getSecretVersions({
+        actorId,
+        actor,
+        actorOrgId,
+        actorAuthMethod,
+        limit,
+        offset,
+        secretId
+      })
+      .catch((err) => {
+        if ((err as Error).message === "BadRequest: Failed to find secret") {
+          return null;
+        }
+      });
+    if (secretVersionV2) return secretVersionV2;
+
     const secret = await secretDAL.findById(secretId);
-    if (!secret) throw new BadRequestError({ message: "Failed to find secret" });
-
+    if (!secret) throw new NotFoundError({ message: `Secret with ID '${secretId}' not found` });
     const folder = await folderDAL.findById(secret.folderId);
-    if (!folder) throw new BadRequestError({ message: "Failed to find secret" });
+    if (!folder) throw new NotFoundError({ message: `Folder with ID '${secret.folderId}' not found` });
 
-    const { permission } = await permissionService.getProjectPermission(actor, actorId, folder.projectId);
+    const { botKey } = await projectBotService.getBotKey(folder.projectId);
+    if (!botKey)
+      throw new NotFoundError({ message: `Project bot for project with ID '${folder.projectId}' not found` });
+
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId: folder.projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
     ForbiddenError.from(permission).throwUnlessCan(ProjectPermissionActions.Read, ProjectPermissionSub.SecretRollback);
-
     const secretVersions = await secretVersionDAL.find({ secretId }, { offset, limit, sort: [["createdAt", "desc"]] });
-    return secretVersions;
+    return secretVersions.map((el) =>
+      decryptSecretRaw(
+        {
+          ...el,
+          workspace: folder.projectId,
+          environment: folder.environment.envSlug,
+          secretPath: "/"
+        },
+        botKey
+      )
+    );
+  };
+
+  const attachTags = async ({
+    secretName,
+    tagSlugs,
+    path: secretPath,
+    environment,
+    type,
+    projectSlug,
+    actor,
+    actorAuthMethod,
+    actorOrgId,
+    actorId
+  }: TAttachSecretTagsDTO) => {
+    const project = await projectDAL.findProjectBySlug(projectSlug, actorOrgId);
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId: project.id,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
+    ForbiddenError.from(permission).throwUnlessCan(
+      ProjectPermissionActions.Edit,
+      subject(ProjectPermissionSub.Secrets, { environment, secretPath })
+    );
+
+    await projectDAL.checkProjectUpgradeStatus(project.id);
+
+    const secret = await getSecretByName({
+      actorId,
+      actor,
+      actorOrgId,
+      actorAuthMethod,
+      projectId: project.id,
+      environment,
+      path: secretPath,
+      secretName,
+      type
+    });
+
+    if (!secret) {
+      throw new NotFoundError({ message: `Secret with name '${secretName}' not found` });
+    }
+    const folder = await folderDAL.findBySecretPath(project.id, environment, secretPath);
+
+    if (!folder) {
+      throw new NotFoundError({
+        message: `Folder with path '${secretPath}' in environment with slug '${environment}' not found`
+      });
+    }
+
+    const tags = await secretTagDAL.find({
+      projectId: project.id,
+      $in: {
+        slug: tagSlugs
+      }
+    });
+
+    if (tags.length !== tagSlugs.length) {
+      throw new NotFoundError({ message: "One or more tags not found." });
+    }
+
+    const existingSecretTags = await secretDAL.getSecretTags(secret.id);
+
+    if (existingSecretTags.some((tag) => tagSlugs.includes(tag.slug))) {
+      throw new BadRequestError({ message: "One or more tags already exist on the secret" });
+    }
+
+    const combinedTags = new Set([...existingSecretTags.map((tag) => tag.id), ...tags.map((el) => el.id)]);
+
+    const updatedSecret = await secretDAL.transaction(async (tx) =>
+      fnSecretBulkUpdate({
+        folderId: folder.id,
+        projectId: project.id,
+        inputSecrets: [
+          {
+            filter: { id: secret.id },
+            data: {
+              tags: Array.from(combinedTags)
+            }
+          }
+        ],
+        secretDAL,
+        secretVersionDAL,
+        secretTagDAL,
+        secretVersionTagDAL,
+        tx
+      })
+    );
+
+    await snapshotService.performSnapshot(folder.id);
+    await secretQueueService.syncSecrets({
+      secretPath,
+      projectId: project.id,
+      orgId: project.orgId,
+      environmentSlug: environment,
+      excludeReplication: true
+    });
+
+    return {
+      ...updatedSecret[0],
+      tags: [...existingSecretTags, ...tags].map((t) => ({ id: t.id, slug: t.slug, name: t.slug, color: t.color }))
+    };
+  };
+
+  const detachTags = async ({
+    secretName,
+    tagSlugs,
+    path: secretPath,
+    environment,
+    type,
+    projectSlug,
+    actor,
+    actorAuthMethod,
+    actorOrgId,
+    actorId
+  }: TAttachSecretTagsDTO) => {
+    const project = await projectDAL.findProjectBySlug(projectSlug, actorOrgId);
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId: project.id,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
+    ForbiddenError.from(permission).throwUnlessCan(
+      ProjectPermissionActions.Edit,
+      subject(ProjectPermissionSub.Secrets, { environment, secretPath })
+    );
+
+    await projectDAL.checkProjectUpgradeStatus(project.id);
+
+    const secret = await getSecretByName({
+      actorId,
+      actor,
+      actorOrgId,
+      actorAuthMethod,
+      projectId: project.id,
+      environment,
+      path: secretPath,
+      secretName,
+      type
+    });
+
+    if (!secret) {
+      throw new NotFoundError({ message: `Secret with name '${secretName}' not found` });
+    }
+    const folder = await folderDAL.findBySecretPath(project.id, environment, secretPath);
+
+    if (!folder) {
+      throw new NotFoundError({
+        message: `Folder with path '${secretPath}' in environment with slug '${environment}' not found`
+      });
+    }
+
+    const tags = await secretTagDAL.find({
+      projectId: project.id,
+      $in: {
+        slug: tagSlugs
+      }
+    });
+
+    if (tags.length !== tagSlugs.length) {
+      throw new NotFoundError({ message: "One or more tags not found." });
+    }
+
+    const existingSecretTags = await secretDAL.getSecretTags(secret.id);
+
+    // Make sure all the tags exist on the secret
+    const tagIdsToRemove = tags.map((tag) => tag.id);
+    const secretTagIds = existingSecretTags.map((tag) => tag.id);
+
+    if (!tagIdsToRemove.every((el) => secretTagIds.includes(el))) {
+      throw new NotFoundError({ message: "One or more tags not found on the secret" });
+    }
+
+    const newTags = existingSecretTags.filter((tag) => !tagIdsToRemove.includes(tag.id));
+
+    const updatedSecret = await secretDAL.transaction(async (tx) =>
+      fnSecretBulkUpdate({
+        folderId: folder.id,
+        projectId: project.id,
+        inputSecrets: [
+          {
+            filter: { id: secret.id },
+            data: {
+              tags: newTags.map((tag) => tag.id)
+            }
+          }
+        ],
+        secretDAL,
+        secretVersionDAL,
+        secretTagDAL,
+        secretVersionTagDAL,
+        tx
+      })
+    );
+
+    await snapshotService.performSnapshot(folder.id);
+    await secretQueueService.syncSecrets({
+      secretPath,
+      projectId: project.id,
+      orgId: project.orgId,
+      environmentSlug: environment,
+      excludeReplication: true
+    });
+
+    return {
+      ...updatedSecret[0],
+      tags: newTags
+    };
+  };
+
+  // this is a backfilling API for secret references
+  // what it does is it will go through all the secret values and parse all references
+  // populate the secret reference to do sync integrations
+  const backfillSecretReferences = async ({
+    projectId,
+    actor,
+    actorId,
+    actorOrgId,
+    actorAuthMethod
+  }: TBackFillSecretReferencesDTO) => {
+    const { hasRole } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
+    if (!hasRole(ProjectMembershipRole.Admin))
+      throw new ForbiddenRequestError({ message: "Only admins are allowed to take this action" });
+
+    const { botKey, shouldUseSecretV2Bridge } = await projectBotService.getBotKey(projectId);
+    if (shouldUseSecretV2Bridge) {
+      return secretV2BridgeService.backfillSecretReferences({
+        projectId,
+        actor,
+        actorId,
+        actorOrgId,
+        actorAuthMethod
+      });
+    }
+
+    if (!botKey)
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${projectId}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
+
+    await secretDAL.transaction(async (tx) => {
+      const secrets = await secretDAL.findAllProjectSecretValues(projectId, tx);
+      await secretDAL.upsertSecretReferences(
+        secrets.map(({ id, secretValueCiphertext, secretValueIV, secretValueTag }) => ({
+          secretId: id,
+          references: getAllNestedSecretReferences(
+            decryptSymmetric128BitHexKeyUTF8({
+              ciphertext: secretValueCiphertext,
+              iv: secretValueIV,
+              tag: secretValueTag,
+              key: botKey
+            })
+          )
+        })),
+        tx
+      );
+    });
+
+    return { message: "Successfully backfilled secret references" };
+  };
+
+  const moveSecrets = async ({
+    sourceEnvironment,
+    sourceSecretPath,
+    destinationEnvironment,
+    destinationSecretPath,
+    secretIds,
+    projectSlug,
+    shouldOverwrite,
+    actor,
+    actorId,
+    actorAuthMethod,
+    actorOrgId
+  }: TMoveSecretsDTO) => {
+    const project = await projectDAL.findProjectBySlug(projectSlug, actorOrgId);
+    if (!project) {
+      throw new NotFoundError({
+        message: `Project with slug '${projectSlug}' not found`
+      });
+    }
+    if (project.version === 3) {
+      return secretV2BridgeService.moveSecrets({
+        sourceEnvironment,
+        sourceSecretPath,
+        destinationEnvironment,
+        destinationSecretPath,
+        secretIds,
+        projectId: project.id,
+        shouldOverwrite,
+        actor,
+        actorId,
+        actorAuthMethod,
+        actorOrgId
+      });
+    }
+
+    const { permission } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId: project.id,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
+    ForbiddenError.from(permission).throwUnlessCan(
+      ProjectPermissionActions.Delete,
+      subject(ProjectPermissionSub.Secrets, {
+        environment: sourceEnvironment,
+        secretPath: sourceSecretPath
+      })
+    );
+
+    ForbiddenError.from(permission).throwUnlessCan(
+      ProjectPermissionActions.Create,
+      subject(ProjectPermissionSub.Secrets, {
+        environment: destinationEnvironment,
+        secretPath: destinationSecretPath
+      })
+    );
+
+    ForbiddenError.from(permission).throwUnlessCan(
+      ProjectPermissionActions.Edit,
+      subject(ProjectPermissionSub.Secrets, {
+        environment: destinationEnvironment,
+        secretPath: destinationSecretPath
+      })
+    );
+
+    const { botKey } = await projectBotService.getBotKey(project.id);
+    if (!botKey) {
+      throw new NotFoundError({
+        message: `Project bot for project with ID '${project.id}' not found. Please upgrade your project.`,
+        name: "bot_not_found_error"
+      });
+    }
+
+    const sourceFolder = await folderDAL.findBySecretPath(project.id, sourceEnvironment, sourceSecretPath);
+    if (!sourceFolder) {
+      throw new NotFoundError({
+        message: `Source folder with path '${sourceSecretPath}' in environment with slug '${sourceEnvironment}' not found`
+      });
+    }
+
+    const destinationFolder = await folderDAL.findBySecretPath(
+      project.id,
+      destinationEnvironment,
+      destinationSecretPath
+    );
+
+    if (!destinationFolder) {
+      throw new NotFoundError({
+        message: `Destination folder with path '${destinationSecretPath}' in environment with slug '${destinationEnvironment}' not found`
+      });
+    }
+
+    const sourceSecrets = await secretDAL.find({
+      type: SecretType.Shared,
+      $in: {
+        id: secretIds
+      }
+    });
+
+    if (sourceSecrets.length !== secretIds.length) {
+      throw new BadRequestError({
+        message: "Invalid secrets"
+      });
+    }
+
+    const decryptedSourceSecrets = sourceSecrets.map((secret) => ({
+      ...secret,
+      secretKey: decryptSymmetric128BitHexKeyUTF8({
+        ciphertext: secret.secretKeyCiphertext,
+        iv: secret.secretKeyIV,
+        tag: secret.secretKeyTag,
+        key: botKey
+      }),
+      secretValue: decryptSymmetric128BitHexKeyUTF8({
+        ciphertext: secret.secretValueCiphertext,
+        iv: secret.secretValueIV,
+        tag: secret.secretValueTag,
+        key: botKey
+      })
+    }));
+
+    let isSourceUpdated = false;
+    let isDestinationUpdated = false;
+
+    // Moving secrets is a two-step process.
+    await secretDAL.transaction(async (tx) => {
+      // First step is to create/update the secret in the destination:
+      const destinationSecretsFromDB = await secretDAL.find(
+        {
+          folderId: destinationFolder.id
+        },
+        { tx }
+      );
+
+      const decryptedDestinationSecrets = destinationSecretsFromDB.map((secret) => {
+        return {
+          ...secret,
+          secretKey: decryptSymmetric128BitHexKeyUTF8({
+            ciphertext: secret.secretKeyCiphertext,
+            iv: secret.secretKeyIV,
+            tag: secret.secretKeyTag,
+            key: botKey
+          }),
+          secretValue: decryptSymmetric128BitHexKeyUTF8({
+            ciphertext: secret.secretValueCiphertext,
+            iv: secret.secretValueIV,
+            tag: secret.secretValueTag,
+            key: botKey
+          })
+        };
+      });
+
+      const destinationSecretsGroupedByBlindIndex = groupBy(
+        decryptedDestinationSecrets.filter(({ secretBlindIndex }) => Boolean(secretBlindIndex)),
+        (i) => i.secretBlindIndex as string
+      );
+
+      const locallyCreatedSecrets = decryptedSourceSecrets
+        .filter(({ secretBlindIndex }) => !destinationSecretsGroupedByBlindIndex[secretBlindIndex as string]?.[0])
+        .map((el) => ({ ...el, operation: SecretOperations.Create }));
+
+      const locallyUpdatedSecrets = decryptedSourceSecrets
+        .filter(
+          ({ secretBlindIndex, secretKey, secretValue }) =>
+            destinationSecretsGroupedByBlindIndex[secretBlindIndex as string]?.[0] &&
+            // if key or value changed
+            (destinationSecretsGroupedByBlindIndex[secretBlindIndex as string]?.[0]?.secretKey !== secretKey ||
+              destinationSecretsGroupedByBlindIndex[secretBlindIndex as string]?.[0]?.secretValue !== secretValue)
+        )
+        .map((el) => ({ ...el, operation: SecretOperations.Update }));
+
+      if (locallyUpdatedSecrets.length > 0 && !shouldOverwrite) {
+        const existingKeys = locallyUpdatedSecrets.map((s) => s.secretKey);
+
+        throw new BadRequestError({
+          message: `Failed to move secrets. The following secrets already exist in the destination: ${existingKeys.join(
+            ","
+          )}`
+        });
+      }
+
+      const isEmpty = locallyCreatedSecrets.length + locallyUpdatedSecrets.length === 0;
+
+      if (isEmpty) {
+        throw new BadRequestError({
+          message: "Selected secrets already exist in the destination."
+        });
+      }
+      const destinationFolderPolicy = await secretApprovalPolicyService.getSecretApprovalPolicy(
+        project.id,
+        destinationFolder.environment.slug,
+        destinationFolder.path
+      );
+
+      if (destinationFolderPolicy && actor === ActorType.USER) {
+        // if secret approval policy exists for destination, we create the secret approval request
+        const localSecretsIds = decryptedDestinationSecrets.map(({ id }) => id);
+        const latestSecretVersions = await secretVersionDAL.findLatestVersionMany(
+          destinationFolder.id,
+          localSecretsIds,
+          tx
+        );
+
+        const approvalRequestDoc = await secretApprovalRequestDAL.create(
+          {
+            folderId: destinationFolder.id,
+            slug: alphaNumericNanoId(),
+            policyId: destinationFolderPolicy.id,
+            status: "open",
+            hasMerged: false,
+            committerUserId: actorId
+          },
+          tx
+        );
+
+        const commits = locallyCreatedSecrets.concat(locallyUpdatedSecrets).map((doc) => {
+          const { operation } = doc;
+          const localSecret = destinationSecretsGroupedByBlindIndex[doc.secretBlindIndex as string]?.[0];
+
+          return {
+            op: operation,
+            keyEncoding: doc.keyEncoding,
+            algorithm: doc.algorithm,
+            requestId: approvalRequestDoc.id,
+            metadata: doc.metadata,
+            secretKeyIV: doc.secretKeyIV,
+            secretKeyTag: doc.secretKeyTag,
+            secretKeyCiphertext: doc.secretKeyCiphertext,
+            secretValueIV: doc.secretValueIV,
+            secretValueTag: doc.secretValueTag,
+            secretValueCiphertext: doc.secretValueCiphertext,
+            secretBlindIndex: doc.secretBlindIndex,
+            secretCommentIV: doc.secretCommentIV,
+            secretCommentTag: doc.secretCommentTag,
+            secretCommentCiphertext: doc.secretCommentCiphertext,
+            skipMultilineEncoding: doc.skipMultilineEncoding,
+            // except create operation other two needs the secret id and version id
+            ...(operation !== SecretOperations.Create
+              ? { secretId: localSecret.id, secretVersion: latestSecretVersions[localSecret.id].id }
+              : {})
+          };
+        });
+        await secretApprovalRequestSecretDAL.insertMany(commits, tx);
+      } else {
+        // apply changes directly
+        if (locallyCreatedSecrets.length) {
+          await fnSecretBulkInsert({
+            folderId: destinationFolder.id,
+            secretVersionDAL,
+            secretDAL,
+            tx,
+            secretTagDAL,
+            secretVersionTagDAL,
+            inputSecrets: locallyCreatedSecrets.map((doc) => {
+              return {
+                keyEncoding: doc.keyEncoding,
+                algorithm: doc.algorithm,
+                type: doc.type,
+                metadata: doc.metadata,
+                secretKeyIV: doc.secretKeyIV,
+                secretKeyTag: doc.secretKeyTag,
+                secretKeyCiphertext: doc.secretKeyCiphertext,
+                secretValueIV: doc.secretValueIV,
+                secretValueTag: doc.secretValueTag,
+                secretValueCiphertext: doc.secretValueCiphertext,
+                secretBlindIndex: doc.secretBlindIndex,
+                secretCommentIV: doc.secretCommentIV,
+                secretCommentTag: doc.secretCommentTag,
+                secretCommentCiphertext: doc.secretCommentCiphertext,
+                skipMultilineEncoding: doc.skipMultilineEncoding
+              };
+            })
+          });
+        }
+        if (locallyUpdatedSecrets.length) {
+          await fnSecretBulkUpdate({
+            projectId: project.id,
+            folderId: destinationFolder.id,
+            secretVersionDAL,
+            secretDAL,
+            tx,
+            secretTagDAL,
+            secretVersionTagDAL,
+            inputSecrets: locallyUpdatedSecrets.map((doc) => {
+              return {
+                filter: {
+                  folderId: destinationFolder.id,
+                  id: destinationSecretsGroupedByBlindIndex[doc.secretBlindIndex as string][0].id
+                },
+                data: {
+                  keyEncoding: doc.keyEncoding,
+                  algorithm: doc.algorithm,
+                  type: doc.type,
+                  metadata: doc.metadata,
+                  secretKeyIV: doc.secretKeyIV,
+                  secretKeyTag: doc.secretKeyTag,
+                  secretKeyCiphertext: doc.secretKeyCiphertext,
+                  secretValueIV: doc.secretValueIV,
+                  secretValueTag: doc.secretValueTag,
+                  secretValueCiphertext: doc.secretValueCiphertext,
+                  secretBlindIndex: doc.secretBlindIndex,
+                  secretCommentIV: doc.secretCommentIV,
+                  secretCommentTag: doc.secretCommentTag,
+                  secretCommentCiphertext: doc.secretCommentCiphertext,
+                  skipMultilineEncoding: doc.skipMultilineEncoding
+                }
+              };
+            })
+          });
+        }
+
+        isDestinationUpdated = true;
+      }
+
+      // Next step is to delete the secrets from the source folder:
+      const sourceSecretsGroupByBlindIndex = groupBy(sourceSecrets, (i) => i.secretBlindIndex as string);
+      const locallyDeletedSecrets = decryptedSourceSecrets.map((el) => ({ ...el, operation: SecretOperations.Delete }));
+
+      const sourceFolderPolicy = await secretApprovalPolicyService.getSecretApprovalPolicy(
+        project.id,
+        sourceFolder.environment.slug,
+        sourceFolder.path
+      );
+
+      if (sourceFolderPolicy && actor === ActorType.USER) {
+        // if secret approval policy exists for source, we create the secret approval request
+        const localSecretsIds = decryptedSourceSecrets.map(({ id }) => id);
+        const latestSecretVersions = await secretVersionDAL.findLatestVersionMany(sourceFolder.id, localSecretsIds, tx);
+        const approvalRequestDoc = await secretApprovalRequestDAL.create(
+          {
+            folderId: sourceFolder.id,
+            slug: alphaNumericNanoId(),
+            policyId: sourceFolderPolicy.id,
+            status: "open",
+            hasMerged: false,
+            committerUserId: actorId
+          },
+          tx
+        );
+
+        const commits = locallyDeletedSecrets.map((doc) => {
+          const { operation } = doc;
+          const localSecret = sourceSecretsGroupByBlindIndex[doc.secretBlindIndex as string]?.[0];
+
+          return {
+            op: operation,
+            keyEncoding: doc.keyEncoding,
+            algorithm: doc.algorithm,
+            requestId: approvalRequestDoc.id,
+            metadata: doc.metadata,
+            secretKeyIV: doc.secretKeyIV,
+            secretKeyTag: doc.secretKeyTag,
+            secretKeyCiphertext: doc.secretKeyCiphertext,
+            secretValueIV: doc.secretValueIV,
+            secretValueTag: doc.secretValueTag,
+            secretValueCiphertext: doc.secretValueCiphertext,
+            secretBlindIndex: doc.secretBlindIndex,
+            secretCommentIV: doc.secretCommentIV,
+            secretCommentTag: doc.secretCommentTag,
+            secretCommentCiphertext: doc.secretCommentCiphertext,
+            skipMultilineEncoding: doc.skipMultilineEncoding,
+            secretId: localSecret.id,
+            secretVersion: latestSecretVersions[localSecret.id].id
+          };
+        });
+
+        await secretApprovalRequestSecretDAL.insertMany(commits, tx);
+      } else {
+        // if no secret approval policy is present, we delete directly.
+        await secretDAL.delete(
+          {
+            $in: {
+              id: locallyDeletedSecrets.map(({ id }) => id)
+            },
+            folderId: sourceFolder.id
+          },
+          tx
+        );
+
+        isSourceUpdated = true;
+      }
+    });
+
+    if (isDestinationUpdated) {
+      await snapshotService.performSnapshot(destinationFolder.id);
+      await secretQueueService.syncSecrets({
+        projectId: project.id,
+        orgId: project.orgId,
+        secretPath: destinationFolder.path,
+        environmentSlug: destinationFolder.environment.slug,
+        actorId,
+        actor
+      });
+    }
+
+    if (isSourceUpdated) {
+      await snapshotService.performSnapshot(sourceFolder.id);
+      await secretQueueService.syncSecrets({
+        projectId: project.id,
+        orgId: project.orgId,
+        secretPath: sourceFolder.path,
+        environmentSlug: sourceFolder.environment.slug,
+        actorId,
+        actor
+      });
+    }
+
+    return {
+      projectId: project.id,
+      isSourceUpdated,
+      isDestinationUpdated
+    };
+  };
+
+  const startSecretV2Migration = async ({
+    projectId,
+    actor,
+    actorId,
+    actorOrgId,
+    actorAuthMethod
+  }: TStartSecretsV2MigrationDTO) => {
+    const { hasRole } = await permissionService.getProjectPermission({
+      actor,
+      actorId,
+      projectId,
+      actorAuthMethod,
+      actorOrgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
+    if (!hasRole(ProjectMembershipRole.Admin))
+      throw new ForbiddenRequestError({ message: "Only admins are allowed to take this action" });
+
+    const { shouldUseSecretV2Bridge: isProjectV3, project } = await projectBotService.getBotKey(projectId);
+    if (isProjectV3) throw new BadRequestError({ message: "Project is already V3" });
+    if (project.upgradeStatus === ProjectUpgradeStatus.InProgress)
+      throw new BadRequestError({ message: "Project is already being upgraded" });
+
+    await secretQueueService.startSecretV2Migration(projectId);
+    return { message: "Migrating project to new KMS architecture" };
+  };
+
+  const getSecretsRawByFolderMappings = async (
+    params: Omit<TGetSecretsRawByFolderMappingsDTO, "userId">,
+    actor: OrgServiceActor
+  ) => {
+    const { shouldUseSecretV2Bridge } = await projectBotService.getBotKey(params.projectId);
+
+    if (!shouldUseSecretV2Bridge) throw new BadRequestError({ message: "Project version not supported" });
+
+    const { permission } = await permissionService.getProjectPermission({
+      actor: actor.type,
+      actorId: actor.id,
+      projectId: params.projectId,
+      actorAuthMethod: actor.authMethod,
+      actorOrgId: actor.orgId,
+      actionProjectType: ActionProjectType.SecretManager
+    });
+
+    const secrets = secretV2BridgeService.getSecretsByFolderMappings({ ...params, userId: actor.id }, permission);
+
+    return secrets;
   };
 
   return {
+    attachTags,
+    detachTags,
     createSecret,
     deleteSecret,
     updateSecret,
@@ -964,13 +3013,18 @@ export const secretServiceFactory = ({
     createSecretRaw,
     updateSecretRaw,
     deleteSecretRaw,
-    listSecretVersionsBySecretId,
+    createManySecretsRaw,
+    updateManySecretsRaw,
+    deleteManySecretsRaw,
     getSecretVersions,
-    // external services function
-    fnSecretBulkDelete,
-    fnSecretBulkUpdate,
-    fnSecretBlindIndexCheck,
-    fnSecretBulkInsert,
-    fnSecretBlindIndexCheckV2
+    backfillSecretReferences,
+    moveSecrets,
+    startSecretV2Migration,
+    getSecretsCount,
+    getSecretsCountMultiEnv,
+    getSecretsRawMultiEnv,
+    getSecretReferenceTree,
+    getSecretsRawByFolderMappings,
+    getSecretAccessList
   };
 };

@@ -21,9 +21,13 @@ export const WebhooksSchema = z.object({
   keyEncoding: z.string().nullable().optional(),
   createdAt: z.date(),
   updatedAt: z.date(),
-  envId: z.string().uuid()
+  envId: z.string().uuid(),
+  urlCipherText: z.string().nullable().optional(),
+  urlIV: z.string().nullable().optional(),
+  urlTag: z.string().nullable().optional(),
+  type: z.string().default("general").nullable().optional()
 });
 
 export type TWebhooks = z.infer<typeof WebhooksSchema>;
-export type TWebhooksInsert = Omit<TWebhooks, TImmutableDBKeys>;
-export type TWebhooksUpdate = Partial<Omit<TWebhooks, TImmutableDBKeys>>;
+export type TWebhooksInsert = Omit<z.input<typeof WebhooksSchema>, TImmutableDBKeys>;
+export type TWebhooksUpdate = Partial<Omit<z.input<typeof WebhooksSchema>, TImmutableDBKeys>>;

@@ -14,9 +14,10 @@ export const SecretFoldersSchema = z.object({
   createdAt: z.date(),
   updatedAt: z.date(),
   envId: z.string().uuid(),
-  parentId: z.string().uuid().nullable().optional()
+  parentId: z.string().uuid().nullable().optional(),
+  isReserved: z.boolean().default(false).nullable().optional()
 });
 
 export type TSecretFolders = z.infer<typeof SecretFoldersSchema>;
-export type TSecretFoldersInsert = Omit<TSecretFolders, TImmutableDBKeys>;
-export type TSecretFoldersUpdate = Partial<Omit<TSecretFolders, TImmutableDBKeys>>;
+export type TSecretFoldersInsert = Omit<z.input<typeof SecretFoldersSchema>, TImmutableDBKeys>;
+export type TSecretFoldersUpdate = Partial<Omit<z.input<typeof SecretFoldersSchema>, TImmutableDBKeys>>;
